@@ -598,6 +598,98 @@ async def fetch_stock_ohlcv_alpaca(
     return _normalize_ohlcv(df)
 
 
+YAHOO_CHART_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
+YAHOO_CHART_INTERVALS = {
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "60m",
+    "4h": "60m",
+    "1d": "1d",
+    "1w": "1wk",
+    "1M": "1mo",
+}
+YAHOO_CHART_RANGES = {
+    "1m": "7d",
+    "5m": "60d",
+    "15m": "60d",
+    "30m": "60d",
+    "1h": "730d",
+    "4h": "730d",
+    "1d": "2y",
+    "1w": "5y",
+    "1M": "10y",
+}
+
+
+async def fetch_stock_ohlcv_yahoo_chart(
+    symbol: str,
+    timeframe: str = "1d",
+    limit: int = 300,
+) -> pd.DataFrame:
+    """Fallback OHLCV via l'API chart Yahoo directe.
+
+    Contourne les limites/cookies de yfinance et couvre actions, ETF, indices
+    (`^IXIC`), forex (`EURUSD=X`) et futures (`GC=F`).
+    """
+    tf = _normalize_timeframe(timeframe)
+    interval = YAHOO_CHART_INTERVALS.get(tf, "1d")
+    range_value = YAHOO_CHART_RANGES.get(tf, "2y")
+    encoded = urllib.parse.quote(symbol.upper(), safe="")
+    data = await _get_json(
+        f"{YAHOO_CHART_BASE}/{encoded}",
+        params={
+            "range": range_value,
+            "interval": interval,
+            "includePrePost": "false",
+            "events": "div,splits",
+        },
+    )
+    results = ((data or {}).get("chart") or {}).get("result") or []
+    if not results:
+        raise DataFetchError(f"Yahoo chart n'a retourné aucune donnée pour {symbol}.")
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    opens = quotes.get("open") or []
+    highs = quotes.get("high") or []
+    lows = quotes.get("low") or []
+    closes = quotes.get("close") or []
+    volumes = quotes.get("volume") or []
+
+    rows: list[dict[str, Any]] = []
+    for index, timestamp in enumerate(timestamps):
+        try:
+            close = closes[index]
+        except IndexError:
+            continue
+        if close is None:
+            continue
+        rows.append(
+            {
+                "Open": opens[index] if index < len(opens) and opens[index] is not None else close,
+                "High": highs[index] if index < len(highs) and highs[index] is not None else close,
+                "Low": lows[index] if index < len(lows) and lows[index] is not None else close,
+                "Close": close,
+                "Volume": volumes[index] if index < len(volumes) and volumes[index] is not None else 0,
+                "timestamp": pd.to_datetime(timestamp, unit="s", utc=True),
+            }
+        )
+    if not rows:
+        raise DataFetchError(f"Yahoo chart a retourné des bougies vides pour {symbol}.")
+
+    frame = pd.DataFrame(rows).set_index("timestamp")
+    normalized = _normalize_ohlcv(frame)
+    if tf == "4h" and not normalized.empty:
+        aggregated = normalized.resample("4h").agg(
+            {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+        ).dropna(subset=["Close"])
+        if not aggregated.empty:
+            normalized = aggregated
+    return normalized.tail(limit)
+
+
 async def fetch_stock_ohlcv_yfinance(
     symbol: str,
     timeframe: str = "1d",
@@ -625,6 +717,13 @@ async def fetch_stock_ohlcv_yfinance(
                 if not aggregated.empty:
                     normalized = aggregated
             return normalized.tail(limit)
+    except Exception:
+        pass
+
+    try:
+        fallback = await fetch_stock_ohlcv_yahoo_chart(symbol, timeframe, limit)
+        if fallback is not None and not fallback.empty:
+            return fallback
     except Exception:
         pass
 
