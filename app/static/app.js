@@ -1139,6 +1139,76 @@
       .join("");
   }
 
+  let screenerModalSymbol = null;
+
+  function openScreenerModal(symbol) {
+    const modal = $("screener-modal");
+    const body = $("screener-modal-body");
+    const title = $("screener-modal-symbol");
+    const subtitle = $("screener-modal-subtitle");
+    if (!modal || !body) return;
+    const row = (state.screenerRows || []).find(
+      (item) => String(item.symbol || "").toUpperCase() === String(symbol || "").toUpperCase()
+    );
+    if (!row) {
+      toast("Symbole introuvable dans le screener.", true);
+      return;
+    }
+    screenerModalSymbol = row.symbol;
+    if (title) title.textContent = row.symbol;
+    if (subtitle) {
+      subtitle.textContent = (row.market_type === "crypto" ? "Crypto" : "Actions US") + " · " + (row.grade || "-") + " · score " + num(row.surge_score, 1) + "/100";
+    }
+    const signals = (row.signals || []).map((signal) => '<li>' + escapeHtml(signal) + "</li>").join("");
+    const cells = [
+      ["Prix", fmtPrice(row.price)],
+      ["Score", num(row.surge_score, 1) + " / 100"],
+      ["Grade", row.grade || "—"],
+      ["RSI 14", num(row.rsi14, 1)],
+      ["Volume", num(row.volume_ratio, 2) + "x"],
+      ["Momentum 5j", fmtPct(row.momentum_5d_pct, 2)],
+      ["ATR", num(row.atr_pct, 2) + " %"],
+      ["Tendance", row.trend || "n/a"],
+      ["Support", fmtPrice(row.nearest_support)],
+      ["Résistance", fmtPrice(row.nearest_resistance)],
+      ["Volatilité annualisée", num(row.volatility_annualized_pct, 1) + " %"],
+      ["Score PRISM", num(row.prism_composite, 1)],
+    ];
+    body.innerHTML =
+      '<div class="grid grid-cols-2 gap-2.5 sm:grid-cols-3">' +
+      cells
+        .map(
+          ([label, value]) =>
+            '<div class="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2"><div class="text-[9px] uppercase tracking-wide text-slate-500">' +
+            escapeHtml(label) + '</div><div class="metric-value mt-0.5 text-sm font-semibold text-slate-100">' + escapeHtml(value) + "</div></div>"
+        )
+        .join("") +
+      "</div>" +
+      (signals
+        ? '<div class="mt-3 text-[10px] font-semibold uppercase tracking-wide text-teal-300">Signaux détectés</div><ul class="mt-1 list-disc space-y-1 pl-4 text-[11px] text-slate-400">' + signals + "</ul>"
+        : '<p class="mt-3 text-[11px] text-slate-500">Aucun signal complémentaire.</p>');
+    modal.classList.remove("hidden");
+    modal.setAttribute("aria-hidden", "false");
+  }
+
+  function closeScreenerModal() {
+    const modal = $("screener-modal");
+    if (!modal) return;
+    modal.classList.add("hidden");
+    modal.setAttribute("aria-hidden", "true");
+    screenerModalSymbol = null;
+  }
+
+  function analyzeFromScreenerModal() {
+    const symbol = screenerModalSymbol;
+    if (!symbol) return;
+    closeScreenerModal();
+    const input = $("ticker-input");
+    if (input) input.value = symbol;
+    activateTab("analyse");
+    runAnalysis(false);
+  }
+
   async function loadScreener() {
     const button = $("run-screener-btn");
     const body = $("screener-body");
@@ -1537,6 +1607,21 @@
     if (calc) calc.addEventListener("click", calculateOptions);
     const openTradeButton = $("open-trade-btn");
     if (openTradeButton) openTradeButton.addEventListener("click", openTrade);
+    const screenerModalClose = $("screener-modal-close");
+    if (screenerModalClose) screenerModalClose.addEventListener("click", closeScreenerModal);
+    const screenerModalDismiss = $("screener-modal-dismiss");
+    if (screenerModalDismiss) screenerModalDismiss.addEventListener("click", closeScreenerModal);
+    const screenerModalAnalyze = $("screener-modal-analyze");
+    if (screenerModalAnalyze) screenerModalAnalyze.addEventListener("click", analyzeFromScreenerModal);
+    const screenerModal = $("screener-modal");
+    if (screenerModal) {
+      screenerModal.addEventListener("click", (event) => {
+        if (event.target === screenerModal) closeScreenerModal();
+      });
+    }
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeScreenerModal();
+    });
 
     const positionsBody = $("positions-body");
     if (positionsBody) {
@@ -1551,9 +1636,7 @@
       screenerBody.addEventListener("click", (event) => {
         const row = event.target.closest("[data-symbol]");
         if (!row) return;
-        const input = $("ticker-input");
-        if (input) input.value = row.dataset.symbol;
-        runAnalysis(false);
+        openScreenerModal(row.dataset.symbol);
       });
     }
 
