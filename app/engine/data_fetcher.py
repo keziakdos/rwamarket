@@ -706,6 +706,7 @@ async def fetch_stock_ohlcv_yfinance(
         ticker = yf.Ticker(symbol.upper())
         return ticker.history(period=period, interval=interval, auto_adjust=True, actions=False)
 
+    partial: pd.DataFrame | None = None
     try:
         df = await asyncio.to_thread(_download)
         if df is not None and not df.empty:
@@ -716,7 +717,9 @@ async def fetch_stock_ohlcv_yfinance(
                 ).dropna(subset=["Close"])
                 if not aggregated.empty:
                     normalized = aggregated
-            return normalized.tail(limit)
+            if len(normalized) >= 20:
+                return normalized.tail(limit)
+            partial = normalized.tail(limit)
     except Exception:
         pass
 
@@ -726,6 +729,9 @@ async def fetch_stock_ohlcv_yfinance(
             return fallback
     except Exception:
         pass
+
+    if partial is not None and not partial.empty:
+        return partial
 
     if not _alpaca_supported(symbol):
         raise DataFetchError(f"Impossible de récupérer les bougies de {symbol} via yfinance.")
