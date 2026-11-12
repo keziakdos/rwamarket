@@ -32,6 +32,7 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel
 
 from app import database as db
+from app.agents import memory as trading_memory
 from app.agents.orchestrator import sse_event, stream_market_analysis
 from app.engine import data_fetcher as fetcher
 from app.engine import notifier, paper_trader, quant_tools
@@ -401,6 +402,7 @@ async def analyze_stream(
     request: Request,
     timeframe: str = "1d",
     risk_profile: str = "moderate",
+    mode: str = "auto",
     force_refresh: bool = False,
     _auth: None = Depends(require_auth),
 ):
@@ -410,6 +412,7 @@ async def analyze_stream(
                 symbol=symbol,
                 timeframe=timeframe,
                 risk_profile=risk_profile,
+                mode=mode,
                 force_refresh=force_refresh,
             ):
                 if await request.is_disconnected():
@@ -464,6 +467,36 @@ async def get_portfolio(_auth: None = Depends(require_auth)):
     except Exception as exc:
         logger.exception("Échec de la récupération du portefeuille")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/memory")
+async def get_trading_memory(
+    symbol: str | None = None,
+    market_type: str | None = None,
+    risk_profile: str = "moderate",
+    _auth: None = Depends(require_auth),
+):
+    """Retourne la mémoire PRISM consolidée (par symbole ou globale)."""
+    if symbol:
+        try:
+            market = market_type or fetcher.detect_market_type(symbol)
+            context = trading_memory.get_memory_context(symbol, market, risk_profile)
+            return {"success": True, "symbol": symbol.upper(), "context": context}
+        except Exception as exc:
+            logger.exception("Échec de la mémoire pour %s", symbol)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        items = db.get_all_trading_memory(limit=200)
+    except Exception as exc:
+        logger.exception("Échec de la récupération de la mémoire globale")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "success": True,
+        "count": len(items),
+        "items": items,
+        "generated_at": datetime.now(UTC).isoformat(),
+    }
 
 
 @app.post("/api/portfolio/order")

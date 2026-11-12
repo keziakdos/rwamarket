@@ -724,6 +724,280 @@ async def fetch_stock_fundamentals(symbol: str) -> dict:
     return await asyncio.to_thread(_fundamentals)
 
 
+def _safe_number(value: Any) -> float | None:
+    """Convertit une valeur pandas/numpy en float natif, sinon None."""
+    try:
+        if value is None:
+            return None
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+async def fetch_piotroski_score(symbol: str) -> dict:
+    """Calcule le Piotroski F-Score (0-9) d'une action US via yfinance.
+
+    Les 9 critères couvrent la rentabilité, le levier/liquidité et l'efficacité
+    opérationnelle. Aucun appel LLM : pur calcul déterministe.
+    """
+    def _compute() -> dict:
+        import pandas as pd
+        import yfinance as yf
+
+        result: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "score": 0,
+            "max_score": 9,
+            "criteria": {},
+            "fetched_at": datetime.now(UTC).isoformat(),
+        }
+
+        try:
+            ticker = yf.Ticker(symbol.upper())
+            quarterly_financials = ticker.quarterly_financials
+            quarterly_cashflow = ticker.quarterly_cashflow
+            annual_financials = ticker.financials
+            annual_balance = ticker.balance_sheet
+        except Exception as exc:
+            result["error"] = f"Données financières indisponibles : {exc}"
+            return result
+
+        def is_empty(frame: Any) -> bool:
+            return frame is None or not isinstance(frame, pd.DataFrame) or frame.empty
+
+        if is_empty(quarterly_financials) or is_empty(quarterly_cashflow):
+            result["error"] = "Données trimestrielles insuffisantes."
+            return result
+        if is_empty(annual_financials) or is_empty(annual_balance):
+            result["error"] = "Données annuelles insuffisantes."
+            return result
+
+        def pick(frame: pd.DataFrame, label: str, column: int = 0) -> float | None:
+            try:
+                if label not in frame.index or frame.shape[1] <= column:
+                    return None
+                return _safe_number(frame.loc[label].iloc[column])
+            except Exception:
+                return None
+
+        recent_ni = None
+        for column in range(min(4, quarterly_financials.shape[1])):
+            candidate = pick(quarterly_financials, "Net Income", column)
+            if candidate is not None:
+                recent_ni = candidate if recent_ni is None else recent_ni + candidate
+        recent_ocf = None
+        for column in range(min(4, quarterly_cashflow.shape[1])):
+            candidate = pick(quarterly_cashflow, "Operating Cash Flow", column)
+            if candidate is not None:
+                recent_ocf = candidate if recent_ocf is None else recent_ocf + candidate
+
+        def annual(label: str, column: int, frame: pd.DataFrame) -> float | None:
+            return pick(frame, label, column)
+
+        recent_assets = annual("Total Assets", 0, annual_balance)
+        prev_assets = annual("Total Assets", 1, annual_balance)
+        recent_current_assets = annual("Current Assets", 0, annual_balance)
+        prev_current_assets = annual("Current Assets", 1, annual_balance)
+        recent_current_liab = annual("Current Liabilities", 0, annual_balance)
+        prev_current_liab = annual("Current Liabilities", 1, annual_balance)
+        recent_lt_debt = annual("Long Term Debt", 0, annual_balance)
+        prev_lt_debt = annual("Long Term Debt", 1, annual_balance)
+        recent_shares = annual("Share Issued", 0, annual_balance)
+        prev_shares = annual("Share Issued", 1, annual_balance)
+
+        recent_revenue = annual("Total Revenue", 0, annual_financials)
+        prev_revenue = annual("Total Revenue", 1, annual_financials)
+        recent_gross = annual("Gross Profit", 0, annual_financials)
+        prev_gross = annual("Gross Profit", 1, annual_financials)
+        recent_ni_annual = annual("Net Income", 0, annual_financials)
+        prev_ni_annual = annual("Net Income", 1, annual_financials)
+
+        criteria: dict[str, dict] = {}
+        score = 0
+
+        def add(name: str, passed: bool | None, detail: str) -> None:
+            nonlocal score
+            counted = bool(passed)
+            if counted:
+                score += 1
+            criteria[name] = {"passed": counted if passed is not None else None, "detail": detail}
+
+        roa_recent = (recent_ni / recent_assets) if recent_ni is not None and recent_assets else None
+        roa_prev = (
+            (prev_ni_annual / prev_assets)
+            if prev_ni_annual is not None and prev_assets
+            else None
+        )
+
+        add(
+            "roa_positive",
+            None if roa_recent is None else roa_recent > 0,
+            f"ROA={roa_recent:.4f}" if roa_recent is not None else "ROA indisponible",
+        )
+        add(
+            "cfo_positive",
+            None if recent_ocf is None else recent_ocf > 0,
+            f"CFO={recent_ocf:.0f}" if recent_ocf is not None else "CFO indisponible",
+        )
+        add(
+            "roa_improving",
+            None if roa_recent is None or roa_prev is None else roa_recent > roa_prev,
+            f"ROA {roa_prev} -> {roa_recent}" if roa_recent is not None and roa_prev is not None else "Indisponible",
+        )
+        add(
+            "cfo_exceeds_net_income",
+            None if recent_ocf is None or recent_ni is None else recent_ocf > recent_ni,
+            f"CFO={recent_ocf} vs NI={recent_ni}" if recent_ocf is not None and recent_ni is not None else "Indisponible",
+        )
+
+        def leverage(debt: float | None, assets: float | None) -> float | None:
+            return (debt / assets) if debt is not None and assets else None
+
+        recent_lev = leverage(recent_lt_debt, recent_assets)
+        prev_lev = leverage(prev_lt_debt, prev_assets)
+        add(
+            "leverage_decreasing",
+            None if recent_lev is None or prev_lev is None else recent_lev < prev_lev,
+            f"Levier {prev_lev} -> {recent_lev}" if recent_lev is not None and prev_lev is not None else "Indisponible",
+        )
+
+        def current_ratio(assets: float | None, liab: float | None) -> float | None:
+            return (assets / liab) if assets is not None and liab not in (None, 0) else None
+
+        recent_cr = current_ratio(recent_current_assets, recent_current_liab)
+        prev_cr = current_ratio(prev_current_assets, prev_current_liab)
+        add(
+            "current_ratio_improving",
+            None if recent_cr is None or prev_cr is None else recent_cr > prev_cr,
+            f"Current ratio {prev_cr} -> {recent_cr}" if recent_cr is not None and prev_cr is not None else "Indisponible",
+        )
+        add(
+            "no_dilution",
+            None if recent_shares is None or prev_shares is None else recent_shares <= prev_shares,
+            f"Actions {prev_shares} -> {recent_shares}" if recent_shares is not None and prev_shares is not None else "Indisponible",
+        )
+
+        recent_margin = (
+            (recent_gross / recent_revenue)
+            if recent_gross is not None and recent_revenue
+            else None
+        )
+        prev_margin = (
+            (prev_gross / prev_revenue) if prev_gross is not None and prev_revenue else None
+        )
+        add(
+            "gross_margin_improving",
+            None if recent_margin is None or prev_margin is None else recent_margin > prev_margin,
+            f"Marge {prev_margin} -> {recent_margin}" if recent_margin is not None and prev_margin is not None else "Indisponible",
+        )
+
+        recent_turnover = (
+            (recent_revenue / recent_assets)
+            if recent_revenue is not None and recent_assets
+            else None
+        )
+        prev_turnover = (
+            (prev_revenue / prev_assets) if prev_revenue is not None and prev_assets else None
+        )
+        add(
+            "asset_turnover_improving",
+            None if recent_turnover is None or prev_turnover is None else recent_turnover > prev_turnover,
+            f"Rotation {prev_turnover} -> {recent_turnover}" if recent_turnover is not None and prev_turnover is not None else "Indisponible",
+        )
+
+        result["score"] = score
+        result["criteria"] = criteria
+        return result
+
+    return await asyncio.to_thread(_compute)
+
+
+async def fetch_earnings_calendar(symbol: str) -> dict:
+    """Retourne la prochaine date de publication des résultats d'une action US.
+
+    Trois sources yfinance en cascade : `calendar`, `earnings_dates`, puis
+    `info.earningsTimestamp`. Le timing (BMO/AMC) et l'EPS estimé sont inclus.
+    """
+    def _compute() -> dict:
+        import pandas as pd
+        import yfinance as yf
+
+        result: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "earnings_date": None,
+            "timing": None,
+            "eps_estimate": None,
+            "fetched_at": datetime.now(UTC).isoformat(),
+        }
+
+        try:
+            ticker = yf.Ticker(symbol.upper())
+            today = datetime.now(UTC).date()
+
+            calendar = getattr(ticker, "calendar", None)
+            if isinstance(calendar, dict):
+                raw_dates = calendar.get("Earnings Date") or []
+                if not isinstance(raw_dates, (list, tuple)):
+                    raw_dates = [raw_dates]
+                upcoming = []
+                for raw in raw_dates:
+                    try:
+                        parsed = datetime.fromisoformat(str(raw)[:10]).date()
+                    except ValueError:
+                        continue
+                    if parsed >= today:
+                        upcoming.append(parsed)
+                if upcoming:
+                    result["earnings_date"] = str(min(upcoming))
+                    eps = calendar.get("Earnings Average")
+                    result["eps_estimate"] = _safe_number(eps)
+                    return result
+
+            try:
+                earnings_df = ticker.earnings_dates
+                if earnings_df is not None and not earnings_df.empty:
+                    future = [
+                        index.date() if hasattr(index, "date") else index
+                        for index in earnings_df.index
+                        if (index.date() if hasattr(index, "date") else index) >= today
+                    ]
+                    if future:
+                        next_date = min(future)
+                        result["earnings_date"] = str(next_date)
+                        try:
+                            row = earnings_df.loc[earnings_df.index[-1]]
+                            result["eps_estimate"] = _safe_number(row.get("EPS Estimate"))
+                        except Exception:
+                            result["eps_estimate"] = None
+                        if hasattr(next_date, "hour"):
+                            hour = next_date.hour
+                            result["timing"] = "BMO" if hour < 12 else ("AMC" if hour >= 16 else None)
+                        return result
+            except Exception:
+                pass
+
+            try:
+                info = ticker.info or {}
+                timestamp = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
+                if timestamp:
+                    earnings_date = datetime.fromtimestamp(int(timestamp), UTC).date()
+                    if earnings_date >= today:
+                        result["earnings_date"] = str(earnings_date)
+                        result["timing"] = "AMC"
+                        result["eps_estimate"] = _safe_number(info.get("epsForward"))
+            except Exception:
+                pass
+        except Exception as exc:
+            result["error"] = f"Calendrier earnings indisponible : {exc}"
+
+        return result
+
+    return await asyncio.to_thread(_compute)
+
+
 async def fetch_option_chain(
     symbol: str,
     expiration: str | None = None,

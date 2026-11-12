@@ -129,7 +129,12 @@ async def send_trade_alert(
 ) -> bool:
     """Alerte d'ouverture ou de clôture d'un trade Paper Trading."""
     act = str(action or "").upper()
-    title = "RwaMarket - Paper Trade Ouvert" if act == "OPEN" else "RwaMarket - Paper Trade Cloture"
+    titles = {
+        "OPEN": "RwaMarket - Paper Trade Ouvert",
+        "CLOSE": "RwaMarket - Paper Trade Cloture",
+        "PYRAMID": "RwaMarket - Renforcement Pyramide",
+    }
+    title = titles.get(act, "RwaMarket - Paper Trading")
 
     lines = [f"*{_md_escape(title)}*", ""]
     lines.append(f"*Symbole :* `{_md_escape(position.get('symbol'))}`")

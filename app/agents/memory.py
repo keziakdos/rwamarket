@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -563,6 +564,244 @@ def _build_pitfalls(
             "Aucun piège majeur détecté : maintenir la discipline de stop et de sizing."
         )
     return pitfalls[:6]
+
+
+def evaluate_buy_gates(
+    symbol: str,
+    market_type: str | None = None,
+    risk_profile: str = "moderate",
+    quant_payload: dict | None = None,
+    confidence: float | None = None,
+    now: Any | None = None,
+) -> dict:
+    """Vérifie les règles déterministes PRISM avant d'autoriser un signal BUY.
+
+    Combine le cooldown anti-rachat (`reentry_cooldown`), les stop-outs récents
+    (politique mémoire), le win rate historique, la tendance, le volume, la
+    volatilité et, si fournie, la confiance finale. Aucun appel LLM.
+
+    Retourne un verdict structuré avec la liste des gates bloquantes et des
+    avertissements non bloquants.
+    """
+    market = (market_type or detect_market_type(symbol)).lower()
+    normalized = normalize_symbol(symbol, market)
+    profile = (risk_profile or "moderate").lower()
+    if profile not in {"conservative", "moderate", "aggressive"}:
+        profile = "moderate"
+
+    quant = quant_payload or {}
+    indicators = quant.get("indicators") or {}
+    price = _as_float(quant.get("price"), 0.0)
+    if price <= 0:
+        price = _as_float(indicators.get("price"), 0.0)
+
+    gates: list[dict] = []
+
+    def add_gate(
+        name: str,
+        passed: bool,
+        detail: str,
+        blocking: bool = True,
+        category: str = "risk",
+        value: Any = None,
+    ) -> None:
+        gates.append(
+            {
+                "name": name,
+                "category": category,
+                "passed": bool(passed),
+                "blocking": bool(blocking),
+                "detail": detail,
+                "value": value,
+            }
+        )
+
+    # 1. Cooldown de rachat impulsif (PRISM reentry_cooldown).
+    try:
+        cooldown = db.is_reentry_blocked(normalized, market, now=now)
+    except Exception:
+        cooldown = None
+    add_gate(
+        "reentry_cooldown",
+        cooldown is None,
+        (
+            "Aucun cooldown actif."
+            if cooldown is None
+            else (
+                f"Rachat bloqué : dernière sortie il y a {cooldown.get('gap_hours')}h "
+                f"(fenêtre {cooldown.get('window_hours')}h, PnL {cooldown.get('last_ret')}%)."
+            )
+        ),
+        blocking=True,
+        category="reentry",
+        value=cooldown,
+    )
+
+    # 2. Stop-out récent (politique mémoire : pénalise même hors fenêtre).
+    trades = db.get_trades_history(symbol=normalized, market_type=market, limit=10)
+    latest = trades[0] if trades else None
+    latest_gap_hours = None
+    latest_is_risk = False
+    if latest:
+        latest_gap_hours = _hours_since(latest.get("closed_at"), now)
+        exit_reason = str(latest.get("exit_reason") or "").lower()
+        latest_is_risk = (
+            _as_float(latest.get("pnl_pct"), 0.0) < 0
+            or db.classify_exit_kind(exit_reason) in db.RISK_EXIT_KINDS
+        )
+    fresh_stop = bool(
+        latest_is_risk and latest_gap_hours is not None and latest_gap_hours <= 12.0
+    )
+    add_gate(
+        "fresh_stop_loss",
+        not fresh_stop,
+        (
+            "Aucun stop-out frais dans les 12 dernières heures."
+            if not fresh_stop
+            else (
+                f"Stop-out récent il y a {latest_gap_hours:.1f}h "
+                f"(PnL {latest.get('pnl_pct')}%) : attendre une réaccélération confirmée."
+            )
+        ),
+        blocking=fresh_stop,
+        category="memory",
+        value=latest_gap_hours,
+    )
+
+    # 3. Win rate historique.
+    stats = db.get_performance_stats(symbol=normalized, market_type=market)
+    total_trades = int(stats.get("total_trades") or 0)
+    win_rate = _as_float(stats.get("win_rate_pct"), 50.0)
+    win_rate_block = total_trades >= 8 and win_rate < 30.0
+    win_rate_warn = total_trades >= 5 and win_rate < 45.0
+    add_gate(
+        "win_rate_floor",
+        not (win_rate_block or win_rate_warn),
+        (
+            f"Échantillon insuffisant ({total_trades} trades) : pas de filtre win rate."
+            if total_trades < 5
+            else f"Win rate {win_rate:.1f}% sur {total_trades} trades."
+        ),
+        blocking=win_rate_block,
+        category="memory",
+        value=win_rate,
+    )
+
+    # 4. Confirmation de tendance.
+    trend = str(indicators.get("trend") or quant.get("trend") or "neutral").lower()
+    ma = indicators.get("ma") or {}
+    sma200 = _as_float(ma.get("sma200"), 0.0)
+    below_long_term = bool(price and sma200 and price < sma200)
+    trend_block = trend == "bearish" and below_long_term
+    trend_warn = trend == "bearish" and not trend_block
+    add_gate(
+        "trend_confirmation",
+        not (trend_block or trend_warn),
+        f"Tendance {trend}" + (" sous la SMA200." if below_long_term else "."),
+        blocking=trend_block,
+        category="technical",
+        value=trend,
+    )
+
+    # 5. Confirmation de volume.
+    volume = indicators.get("volume") or {}
+    volume_ratio = volume.get("ratio")
+    volume_warn = volume_ratio is not None and float(volume_ratio) < 0.8
+    add_gate(
+        "volume_confirmation",
+        not volume_warn,
+        (
+            "Volume indisponible."
+            if volume_ratio is None
+            else f"Volume à {float(volume_ratio):.2f}x la moyenne 20j."
+        ),
+        blocking=False,
+        category="technical",
+        value=volume_ratio,
+    )
+
+    # 6. Volatilité excessive.
+    atr_pct = indicators.get("atr_pct")
+    atr_value = _as_float(atr_pct, 0.0) if atr_pct is not None else 0.0
+    volatility_limit = 20.0 if market == "crypto" else 12.0
+    volatility_warn = atr_value > volatility_limit
+    add_gate(
+        "volatility_gate",
+        not volatility_warn,
+        (
+            "Volatilité indisponible."
+            if atr_pct is None
+            else f"ATR {atr_value:.2f}% (limite {volatility_limit:.0f}%)."
+        ),
+        blocking=False,
+        category="risk",
+        value=atr_pct,
+    )
+
+    # 7. Seuil de confiance selon le profil MAIA.
+    if confidence is not None:
+        thresholds = {"conservative": 60.0, "moderate": 50.0, "aggressive": 45.0}
+        threshold = thresholds[profile]
+        confidence_value = _as_float(confidence, 0.0)
+        add_gate(
+            "confidence_floor",
+            confidence_value >= threshold,
+            f"Confiance {confidence_value:.1f}% (seuil {profile} = {threshold:.0f}%).",
+            blocking=confidence_value < threshold - 10.0,
+            category="profile",
+            value=confidence_value,
+        )
+
+    blockers = [gate for gate in gates if gate["blocking"] and not gate["passed"]]
+    warnings = [gate for gate in gates if not gate["blocking"] and not gate["passed"]]
+    allowed = not blockers
+
+    evaluated = max(0.0, 100.0 - len(blockers) * 35.0 - len(warnings) * 10.0)
+    return {
+        "symbol": normalized,
+        "market_type": market,
+        "risk_profile": profile,
+        "allowed": allowed,
+        "score": round(evaluated, 2),
+        "gates": gates,
+        "blockers": blockers,
+        "warnings": warnings,
+        "reentry_cooldown": cooldown,
+        "evaluated_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def check_buy_gates(
+    symbol: str,
+    market_type: str | None = None,
+    risk_profile: str = "moderate",
+    quant_payload: dict | None = None,
+    confidence: float | None = None,
+) -> dict:
+    """Alias explicite de `evaluate_buy_gates` (règle déterministe BUY)."""
+    return evaluate_buy_gates(
+        symbol,
+        market_type=market_type,
+        risk_profile=risk_profile,
+        quant_payload=quant_payload,
+        confidence=confidence,
+    )
+
+
+def _hours_since(timestamp: Any, now: Any | None = None) -> float | None:
+    """Retourne le nombre d'heures écoulées depuis un timestamp ISO, ou None."""
+    if not timestamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    reference = now or datetime.now(UTC)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    return max((reference - parsed).total_seconds() / 3600.0, 0.0)
 
 
 def get_memory_context(

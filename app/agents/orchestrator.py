@@ -34,6 +34,7 @@ from app import database as db
 from app.agents.memory import (
     build_llm_client,
     call_llm_json,
+    evaluate_buy_gates,
     get_memory_context,
 )
 from app.engine import data_fetcher as fetcher
@@ -42,6 +43,22 @@ from app.engine import quant_tools as quant
 DEFAULT_FAST_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 DEFAULT_REASONING_MODEL = "deepseek-ai/DeepSeek-V4-Pro"
 RISK_PROFILES = {"conservative", "moderate", "aggressive"}
+ANALYSIS_MODES = {"auto", "research", "analytical"}
+DEFAULT_ANALYSIS_MODE = "auto"
+MODE_DIRECTIVES = {
+    "auto": (
+        "Mode AUTO : équilibre rapidité et profondeur. Priorise les signaux les plus "
+        "actionnables sans surcharger l'analyse."
+    ),
+    "research": (
+        "Mode RESEARCH : privilégie la découverte de catalyseurs, le contexte macro, "
+        "les actualités et les flux de sentiment. Explore les scénarios alternatifs."
+    ),
+    "analytical": (
+        "Mode ANALYTICAL : privilégie la rigueur quantitative, les niveaux clés, les "
+        "scénarios d'invalidation et la cohérence mathématique du plan de trade."
+    ),
+}
 VALID_VERDICTS = {"BUY", "SELL", "HOLD", "WATCH"}
 VALID_BIASES = {"bullish", "bearish", "neutral"}
 FAST_MAX_TOKENS = 350
@@ -55,18 +72,27 @@ PROFILE_PARAMS = {
         "tp1_rr": 1.5,
         "tp2_rr": 3.0,
         "base_position_pct": 2.0,
+        "allocation_multiplier": 0.5,
+        "max_position_pct": 5.0,
+        "confidence_floor": 60.0,
     },
     "moderate": {
         "atr_multiplier": 1.6,
         "tp1_rr": 2.0,
         "tp2_rr": 3.6,
         "base_position_pct": 5.0,
+        "allocation_multiplier": 1.0,
+        "max_position_pct": 10.0,
+        "confidence_floor": 50.0,
     },
     "aggressive": {
         "atr_multiplier": 1.3,
         "tp1_rr": 2.4,
         "tp2_rr": 4.5,
         "base_position_pct": 10.0,
+        "allocation_multiplier": 1.5,
+        "max_position_pct": 20.0,
+        "confidence_floor": 45.0,
     },
 }
 
@@ -94,6 +120,15 @@ def _reasoning_model() -> str:
 def _normalize_risk_profile(risk_profile: str | None) -> str:
     profile = (risk_profile or "moderate").strip().lower()
     return profile if profile in RISK_PROFILES else "moderate"
+
+
+def _normalize_mode(mode: str | None) -> str:
+    value = (mode or DEFAULT_ANALYSIS_MODE).strip().lower()
+    return value if value in ANALYSIS_MODES else DEFAULT_ANALYSIS_MODE
+
+
+def _mode_directive(mode: str) -> str:
+    return MODE_DIRECTIVES.get(_normalize_mode(mode), MODE_DIRECTIVES[DEFAULT_ANALYSIS_MODE])
 
 
 def _normalize_timeframe(timeframe: str | None) -> str:
@@ -323,7 +358,13 @@ class TechnicalFlowAgent:
             "source": "deterministic",
         }
 
-    async def run(self, symbol: str, market_type: str, quant_payload: dict) -> dict:
+    async def run(
+        self,
+        symbol: str,
+        market_type: str,
+        quant_payload: dict,
+        mode: str = DEFAULT_ANALYSIS_MODE,
+    ) -> dict:
         fallback = self.deterministic(symbol, market_type, quant_payload)
         if self.client is None:
             return fallback
@@ -331,7 +372,8 @@ class TechnicalFlowAgent:
         system_prompt = (
             "Tu es TechnicalFlowAgent, analyste technique institutionnel. Analyse uniquement "
             "les données fournies (prix, EMA, RSI, MACD, Bollinger, ATR, volume, niveaux). "
-            "Réponds en JSON strict, sans markdown ni texte autour."
+            "Réponds en JSON strict, sans markdown ni texte autour. "
+            + _mode_directive(mode)
         )
         user_payload = {
             "symbol": symbol,
@@ -457,7 +499,13 @@ class MacroFundamentalAgent:
             "source": "deterministic",
         }
 
-    async def run(self, symbol: str, market_type: str, quant_payload: dict) -> dict:
+    async def run(
+        self,
+        symbol: str,
+        market_type: str,
+        quant_payload: dict,
+        mode: str = DEFAULT_ANALYSIS_MODE,
+    ) -> dict:
         fallback = self.deterministic(symbol, market_type, quant_payload)
         if self.client is None:
             return fallback
@@ -465,7 +513,8 @@ class MacroFundamentalAgent:
         system_prompt = (
             "Tu es MacroFundamentalAgent, analyste macro et fondamental. Utilise uniquement "
             "les données fournies (valorisation, secteur, objectifs analystes, momentum, "
-            "actualités). Réponds en JSON strict, sans markdown."
+            "actualités). Réponds en JSON strict, sans markdown. "
+            + _mode_directive(mode)
         )
         user_payload = {
             "symbol": symbol,
@@ -608,7 +657,13 @@ class SentimentNewsAgent:
             "source": "deterministic",
         }
 
-    async def run(self, symbol: str, market_type: str, news_items: list[dict]) -> dict:
+    async def run(
+        self,
+        symbol: str,
+        market_type: str,
+        news_items: list[dict],
+        mode: str = DEFAULT_ANALYSIS_MODE,
+    ) -> dict:
         fallback = self.deterministic(symbol, market_type, news_items)
         if self.client is None:
             return fallback
@@ -625,7 +680,8 @@ class SentimentNewsAgent:
         system_prompt = (
             "Tu es SentimentNewsAgent, analyste de sentiment de marché. Analyse uniquement "
             "les titres et résumés fournis. Distingue le bruit du risque réel. Réponds en "
-            "JSON strict, sans markdown."
+            "JSON strict, sans markdown. "
+            + _mode_directive(mode)
         )
         user_payload = {
             "symbol": symbol,
@@ -787,6 +843,7 @@ class ChiefStrategyAgent:
         quant_payload: dict,
         agents: dict,
         memory_context: dict,
+        mode: str = DEFAULT_ANALYSIS_MODE,
     ) -> dict:
         technical = agents.get("technical") or {}
         macro = agents.get("macro") or {}
@@ -815,6 +872,11 @@ class ChiefStrategyAgent:
             verdict = "WATCH"
         else:
             verdict = "HOLD"
+
+        gates = quant_payload.get("buy_gates") or {}
+        gate_blocked = bool(verdict == "BUY" and gates and not gates.get("allowed", True))
+        if gate_blocked:
+            verdict = "WATCH"
 
         confidence = 42.0 + abs(weighted - 50) * 1.15 + agreement * 6.0
         confidence += (
@@ -888,6 +950,9 @@ class ChiefStrategyAgent:
             "market_type": market_type,
             "timeframe": quant_payload.get("timeframe"),
             "risk_profile": _normalize_risk_profile(risk_profile),
+            "analysis_mode": _normalize_mode(mode),
+            "buy_gates": gates or None,
+            "buy_gates_blocked": gate_blocked,
             "bull_case": bull_case,
             "bear_case": bear_case,
             "verdict": verdict,
@@ -918,9 +983,16 @@ class ChiefStrategyAgent:
         quant_payload: dict,
         agents: dict,
         memory_context: dict,
+        mode: str = DEFAULT_ANALYSIS_MODE,
     ) -> dict:
         fallback = self.deterministic(
-            symbol, market_type, risk_profile, quant_payload, agents, memory_context
+            symbol,
+            market_type,
+            risk_profile,
+            quant_payload,
+            agents,
+            memory_context,
+            mode=mode,
         )
         if self.client is None:
             return fallback
@@ -929,13 +1001,16 @@ class ChiefStrategyAgent:
             "Tu es ChiefStrategyAgent, stratège et Risk Manager. Organise un débat "
             "Bull vs Bear à partir des trois rapports d'agents, du profil de risque et "
             "de la mémoire de trading. Tranche avec un verdict BUY/SELL/HOLD/WATCH et "
-            "construis un plan de trade cohérent. Réponds en JSON strict, sans markdown."
+            "construis un plan de trade cohérent. Réponds en JSON strict, sans markdown. "
+            + _mode_directive(mode)
         )
         user_payload = {
             "symbol": symbol,
             "market_type": market_type,
             "timeframe": quant_payload.get("timeframe"),
             "risk_profile": _normalize_risk_profile(risk_profile),
+            "analysis_mode": _normalize_mode(mode),
+            "buy_gates": quant_payload.get("buy_gates"),
             "price": quant_payload.get("price"),
             "atr14": quant_payload.get("atr14"),
             "technical_score": quant_payload.get("technical_score"),
@@ -1007,6 +1082,10 @@ class ChiefStrategyAgent:
             return fallback
 
         verdict = _normalize_verdict(payload.get("verdict"), fallback["verdict"])
+        gates = quant_payload.get("buy_gates") or {}
+        gate_blocked = bool(verdict == "BUY" and gates and not gates.get("allowed", True))
+        if gate_blocked:
+            verdict = "WATCH"
         confidence = _clamp(payload.get("confidence"), 0, 100, fallback["confidence"])
         atr = _as_float(
             quant_payload.get("atr14"),
@@ -1042,6 +1121,9 @@ class ChiefStrategyAgent:
                 "verdict": verdict,
                 "confidence": round(confidence, 2),
                 "trade_plan": plan,
+                "analysis_mode": _normalize_mode(mode),
+                "buy_gates": gates or None,
+                "buy_gates_blocked": gate_blocked,
                 "rationale": rationale[:1200] if rationale else fallback["rationale"],
                 "source": "llm",
                 "generated_at": datetime.now(UTC).isoformat(),
@@ -1241,14 +1323,20 @@ async def stream_market_analysis(
     symbol: str,
     timeframe: str = "1d",
     risk_profile: str = "moderate",
+    mode: str = DEFAULT_ANALYSIS_MODE,
     force_refresh: bool = False,
 ) -> AsyncGenerator[str, None]:
-    """Produit le flux SSE complet d'analyse d'un symbole."""
+    """Produit le flux SSE complet d'analyse d'un symbole.
+
+    `mode` : `auto` (équilibré), `research` (catalyseurs/actualités) ou
+    `analytical` (rigueur quantitative et scénarios d'invalidation).
+    """
     started = time.perf_counter()
     market_type = fetcher.detect_market_type(symbol)
     normalized_symbol = fetcher.normalize_symbol(symbol, market_type)
     normalized_timeframe = _normalize_timeframe(timeframe)
     normalized_risk = _normalize_risk_profile(risk_profile)
+    normalized_mode = _normalize_mode(mode)
     ttl_minutes = int(os.getenv("CACHE_TTL_MINUTES", "30"))
 
     if not force_refresh:
@@ -1279,6 +1367,14 @@ async def stream_market_analysis(
             core_data,
             memory_context,
         )
+        quant_payload["analysis_mode"] = normalized_mode
+        buy_gates = evaluate_buy_gates(
+            normalized_symbol,
+            market_type,
+            normalized_risk,
+            quant_payload,
+        )
+        quant_payload["buy_gates"] = buy_gates
         quant_payload["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
         yield sse_event("quant", quant_payload)
     except Exception as exc:
@@ -1322,7 +1418,7 @@ async def stream_market_analysis(
                 queue,
                 technical_agent.key,
                 technical_agent.event_name,
-                technical_agent.run(normalized_symbol, market_type, quant_payload),
+                technical_agent.run(normalized_symbol, market_type, quant_payload, mode=normalized_mode),
             )
         ),
         asyncio.create_task(
@@ -1330,7 +1426,7 @@ async def stream_market_analysis(
                 queue,
                 macro_agent.key,
                 macro_agent.event_name,
-                macro_agent.run(normalized_symbol, market_type, quant_payload),
+                macro_agent.run(normalized_symbol, market_type, quant_payload, mode=normalized_mode),
             )
         ),
         asyncio.create_task(
@@ -1338,7 +1434,7 @@ async def stream_market_analysis(
                 queue,
                 sentiment_agent.key,
                 sentiment_agent.event_name,
-                sentiment_agent.run(normalized_symbol, market_type, news_items),
+                sentiment_agent.run(normalized_symbol, market_type, news_items, mode=normalized_mode),
             )
         ),
     ]
@@ -1368,6 +1464,7 @@ async def stream_market_analysis(
             quant_payload,
             collected,
             memory_context,
+            mode=normalized_mode,
         )
     except Exception as exc:
         synthesis_payload = chief.deterministic(
@@ -1377,8 +1474,29 @@ async def stream_market_analysis(
             quant_payload,
             collected,
             memory_context,
+            mode=normalized_mode,
         )
         synthesis_payload["error"] = str(exc)
+
+    final_gates = evaluate_buy_gates(
+        normalized_symbol,
+        market_type,
+        normalized_risk,
+        quant_payload,
+        confidence=synthesis_payload.get("confidence"),
+    )
+    synthesis_payload["buy_gates"] = final_gates
+    if synthesis_payload.get("verdict") == "BUY" and not final_gates.get("allowed", True):
+        synthesis_payload["verdict"] = "WATCH"
+        synthesis_payload["buy_gates_blocked"] = True
+        blockers = ", ".join(
+            gate["name"] for gate in final_gates.get("blockers", [])
+        )
+        existing = str(synthesis_payload.get("rationale") or "").strip()
+        synthesis_payload["rationale"] = (
+            (existing + " " if existing else "")
+            + f"Verdict BUY dégradé en WATCH : gates non satisfaites ({blockers})."
+        )
 
     try:
         db.save_analysis_cache(

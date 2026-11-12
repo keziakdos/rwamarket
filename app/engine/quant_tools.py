@@ -100,6 +100,62 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return true_range.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
 
+def _adx(df: pd.DataFrame, period: int = 14) -> dict[str, pd.Series]:
+    """Calcule l'ADX de Wilder avec les DI+ et DI-.
+
+    Portage déterministe de `trading_skills.technicals.compute_raw_indicators`
+    (ADX 14) sans dépendance à pandas-ta.
+    """
+    high, low, close = df["High"].astype(float), df["Low"].astype(float), df["Close"].astype(float)
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index
+    )
+
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+
+    alpha = 1.0 / period
+    atr = true_range.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    plus_dm_smooth = plus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    minus_dm_smooth = minus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+
+    plus_di = 100.0 * plus_dm_smooth / atr.replace(0.0, np.nan)
+    minus_di = 100.0 * minus_dm_smooth / atr.replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+    adx_series = dx.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+
+    return {"adx": adx_series, "plus_di": plus_di, "minus_di": minus_di}
+
+
+def _value_at_risk(close: pd.Series, confidence: float = 0.95) -> float | None:
+    """VaR historique 1 jour en % de la valeur du portefeuille (perte positive)."""
+    returns = close.pct_change().dropna()
+    if len(returns) < 20:
+        return None
+    lower_tail = np.quantile(returns.to_numpy(), 1.0 - confidence)
+    return _finite(-float(lower_tail) * 100.0, 4)
+
+
+def _expected_shortfall(close: pd.Series, confidence: float = 0.95) -> float | None:
+    """Expected Shortfall (CVaR) historique 1 jour en %, perte positive."""
+    returns = close.pct_change().dropna()
+    if len(returns) < 20:
+        return None
+    threshold = np.quantile(returns.to_numpy(), 1.0 - confidence)
+    tail = returns[returns <= threshold]
+    if len(tail) == 0:
+        return None
+    return _finite(-float(tail.mean()) * 100.0, 4)
+
+
 def _detect_crossover(fast: pd.Series, slow: pd.Series) -> dict | None:
     """Détecte le dernier croisement fast/slow et son ancienneté en bougies."""
     diff = (fast - slow).dropna()
@@ -251,6 +307,7 @@ def compute_technicals(
     macd_frame = _macd(close)
     bollinger_frame = _bollinger(close)
     atr_series = _atr(data, 14)
+    adx_frame = _adx(data, 14)
 
     ema9 = _series_last(ema9_series)
     ema20 = _series_last(ema20_series)
@@ -271,6 +328,10 @@ def compute_technicals(
 
     atr14 = _series_last(atr_series)
     atr_pct = (atr14 / current_price * 100.0) if atr14 and current_price else None
+
+    adx14 = _series_last(adx_frame["adx"], 2)
+    plus_di = _series_last(adx_frame["plus_di"], 2)
+    minus_di = _series_last(adx_frame["minus_di"], 2)
 
     volume_last = _finite(volume.iloc[-1], 4)
     if len(volume) > 20:
@@ -294,6 +355,10 @@ def compute_technicals(
         std = float(log_returns.tail(periods_per_year).std(ddof=1))
         if std > 0:
             sharpe_ratio = _finite(float(log_returns.tail(periods_per_year).mean()) / std * math.sqrt(periods_per_year), 4)
+
+    var_95 = _value_at_risk(close, 0.95)
+    var_99 = _value_at_risk(close, 0.99)
+    cvar_95 = _expected_shortfall(close, 0.95)
 
     momentum = {}
     for label, periods in (("1d", 1), ("5d", 5), ("20d", 20), ("60d", 60)):
@@ -331,6 +396,9 @@ def compute_technicals(
             signals.append("Histogramme MACD en contraction")
     if volume_ratio is not None and volume_ratio >= 1.8:
         signals.append(f"Volume anormal ({volume_ratio:.2f}x la moyenne 20j)")
+    if adx14 is not None and adx14 > 25 and plus_di is not None and minus_di is not None:
+        direction = "haussière" if plus_di > minus_di else "baissière"
+        signals.append(f"Tendance {direction} confirmée (ADX {adx14:.1f}, DI+ {plus_di:.1f} / DI- {minus_di:.1f})")
     if current_price >= (bb_upper or float("inf")):
         signals.append("Prix au-dessus de la bande de Bollinger supérieure")
     elif current_price <= (bb_lower or float("-inf")):
@@ -419,6 +487,14 @@ def compute_technicals(
         },
         "atr14": atr14,
         "atr_pct": _finite(atr_pct, 4),
+        "adx": {
+            "adx14": adx14,
+            "plus_di": plus_di,
+            "minus_di": minus_di,
+            "trend_strength": (
+                "strong" if adx14 is not None and adx14 > 25 else ("weak" if adx14 is not None else None)
+            ),
+        },
         "volume": {
             "last": volume_last,
             "avg20": volume_avg20,
@@ -427,6 +503,11 @@ def compute_technicals(
         "support_resistance": levels,
         "volatility_annualized_pct": volatility_annualized,
         "sharpe_ratio": sharpe_ratio,
+        "var": {
+            "var_95_1d_pct": var_95,
+            "var_99_1d_pct": var_99,
+            "cvar_95_1d_pct": cvar_95,
+        },
         "max_drawdown_pct": _finite(_max_drawdown(close), 4),
         "signals": signals,
     }
@@ -435,6 +516,65 @@ def compute_technicals(
         result["candles"] = _serialize_candles(data, candle_limit)
 
     return result
+
+
+def compute_correlation_matrix(
+    symbols: Iterable[str],
+    timeframe: str = "1d",
+    limit: int = 90,
+    market_type: str | None = None,
+) -> dict:
+    """Calcule la matrice de corrélation des rendements entre plusieurs actifs.
+
+    Extrait de `trading_skills.correlation` : aligne les clôtures, convertit en
+    rendements et renvoie une matrice imbriquée JSON-safe. Aucun appel LLM.
+    """
+    wanted = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+    if len(wanted) < 2:
+        return {"error": "Au moins 2 symboles sont nécessaires pour la corrélation."}
+
+    closes: dict[str, pd.Series] = {}
+    for symbol in wanted:
+        try:
+            resolved_market = market_type or detect_market_type(symbol)
+            normalized = normalize_symbol(symbol, resolved_market)
+            frame = fetch_ohlcv_sync(
+                normalized,
+                timeframe=timeframe,
+                limit=limit,
+                market_type=resolved_market,
+            )
+            if frame is None or frame.empty or "Close" not in frame.columns:
+                continue
+            series = frame["Close"].astype(float)
+            series.name = symbol
+            closes[symbol] = series
+        except Exception:
+            continue
+
+    if len(closes) < 2:
+        return {"error": "Données insuffisantes : moins de 2 symboles valides."}
+
+    price_frame = pd.DataFrame(closes).dropna(how="all")
+    returns_frame = price_frame.pct_change().dropna(how="all")
+    returns_frame = returns_frame.dropna(axis=1, how="all")
+    if returns_frame.shape[1] < 2 or len(returns_frame) < 2:
+        return {"error": "Historique commun insuffisant pour calculer la corrélation."}
+
+    correlation = returns_frame.corr()
+    matrix: dict[str, dict[str, float | None]] = {}
+    for row_symbol in correlation.index:
+        matrix[row_symbol] = {
+            column_symbol: _finite(correlation.loc[row_symbol, column_symbol], 4)
+            for column_symbol in correlation.columns
+        }
+
+    return {
+        "symbols": list(correlation.columns),
+        "timeframe": timeframe,
+        "observations": int(len(returns_frame)),
+        "correlation_matrix": matrix,
+    }
 
 
 def compute_indicators(
@@ -831,6 +971,152 @@ def preview_option_setup(
 
 
 # ---------------------------------------------------------------------------
+# Éligibilité PMCC (extrait de trading_skills.scanner_pmcc)
+# ---------------------------------------------------------------------------
+def _contract_mid(contract: dict | None) -> float | None:
+    if not contract:
+        return None
+    for key in ("mid", "mid_price", "mark"):
+        value = _finite(contract.get(key))
+        if value:
+            return value
+    bid = _finite(contract.get("bid"))
+    ask = _finite(contract.get("ask"))
+    if bid is not None and ask is not None and bid > 0 and ask > 0:
+        return _finite((bid + ask) / 2.0)
+    return _finite(contract.get("lastPrice") or contract.get("last"))
+
+
+def _contract_spread_pct(contract: dict | None) -> float | None:
+    if not contract:
+        return None
+    bid = _finite(contract.get("bid"))
+    ask = _finite(contract.get("ask"))
+    if bid is None or ask is None or ask <= 0 or bid <= 0 or ask < bid:
+        return None
+    mid = (bid + ask) / 2.0
+    return _finite((ask - bid) / mid * 100.0, 2) if mid else None
+
+
+def score_pmcc_eligibility(
+    underlying_price: float,
+    leaps_contract: dict | None,
+    short_contract: dict | None,
+    annual_yield_pct: float | None = None,
+    earnings_days: int | None = None,
+    trend_score: float | None = None,
+    has_weeklies: bool | None = None,
+) -> dict:
+    """Note l'éligibilité d'un sous-jacent à un Poor Man's Covered Call sur 14.
+
+    Portage déterministe du scoring `scanner_pmcc` : précision du delta,
+    liquidité, spread, rendement annualisé, tendance et proximité des résultats.
+    Le résultat est directement consommable par l'UI ou le Risk Manager.
+    """
+    price = _finite(underlying_price)
+    breakdown: dict[str, float] = {}
+    notes: list[str] = []
+    score = 0.0
+
+    if not price or price <= 0:
+        return {
+            "pmcc_score": 0.0,
+            "max_possible_score": 14.0,
+            "eligible": False,
+            "score_breakdown": {},
+            "notes": ["Prix sous-jacent invalide."],
+        }
+
+    leaps_delta = abs(_finite((leaps_contract or {}).get("delta")) or 0.0)
+    short_delta = abs(_finite((short_contract or {}).get("delta")) or 0.0)
+
+    if leaps_delta:
+        if 0.70 <= leaps_delta <= 0.85:
+            breakdown["leaps_delta"] = 2.0
+            notes.append(f"Delta LEAPS optimal ({leaps_delta:.2f}).")
+        elif 0.60 <= leaps_delta <= 0.90:
+            breakdown["leaps_delta"] = 1.0
+        else:
+            notes.append(f"Delta LEAPS hors plage ({leaps_delta:.2f}).")
+
+    if short_delta:
+        if 0.20 <= short_delta <= 0.35:
+            breakdown["short_delta"] = 2.0
+            notes.append(f"Delta short call optimal ({short_delta:.2f}).")
+        elif 0.15 <= short_delta <= 0.45:
+            breakdown["short_delta"] = 1.0
+        else:
+            notes.append(f"Delta short call hors plage ({short_delta:.2f}).")
+
+    for label, contract in (("leaps", leaps_contract), ("short", short_contract)):
+        if not contract:
+            continue
+        open_interest = _finite(contract.get("openInterest") or contract.get("open_interest")) or 0.0
+        volume = _finite(contract.get("volume")) or 0.0
+        liquidity_points = 0.0
+        if open_interest >= 500:
+            liquidity_points += 1.0
+        elif open_interest >= 100:
+            liquidity_points += 0.5
+        if volume >= 50:
+            liquidity_points += 1.0
+        elif volume >= 10:
+            liquidity_points += 0.5
+        if liquidity_points:
+            breakdown[f"{label}_liquidity"] = liquidity_points
+            if liquidity_points >= 2.0:
+                notes.append(f"Liquidité {label} solide (OI {open_interest:.0f}, vol {volume:.0f}).")
+
+        spread = _contract_spread_pct(contract)
+        if spread is not None:
+            if spread <= 5.0:
+                breakdown[f"{label}_spread"] = 1.0
+            elif spread <= 10.0:
+                breakdown[f"{label}_spread"] = 0.5
+            else:
+                notes.append(f"Spread {label} large ({spread:.1f}%).")
+
+    if annual_yield_pct is not None:
+        if annual_yield_pct >= 12.0:
+            breakdown["annual_yield"] = 2.0
+            notes.append(f"Rendement annualisé attractif ({annual_yield_pct:.1f}%).")
+        elif annual_yield_pct >= 8.0:
+            breakdown["annual_yield"] = 1.5
+        elif annual_yield_pct >= 5.0:
+            breakdown["annual_yield"] = 1.0
+
+    if trend_score is not None:
+        if trend_score >= 1.0:
+            breakdown["trend"] = 1.5
+            notes.append("Tendance haussière confirmée.")
+        elif trend_score > 0:
+            breakdown["trend"] = 0.75
+
+    if earnings_days is not None:
+        if earnings_days > 45:
+            breakdown["earnings"] = 1.0
+        elif earnings_days < 0:
+            breakdown["earnings"] = 0.0
+        elif earnings_days <= 21:
+            breakdown["earnings"] = -2.0
+            notes.append("Résultats trop proches : risque de gap/IV crush.")
+        else:
+            breakdown["earnings"] = -1.0
+
+    if has_weeklies:
+        breakdown["weeklies"] = 1.0
+
+    score = round(max(0.0, min(sum(breakdown.values()), 14.0)), 2)
+    return {
+        "pmcc_score": score,
+        "max_possible_score": 14.0,
+        "eligible": score >= 8.0,
+        "score_breakdown": breakdown,
+        "notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Screener déterministe (prism-insight)
 # ---------------------------------------------------------------------------
 def _compute_surge_score(technicals: dict) -> tuple[float, list[str]]:
@@ -912,6 +1198,28 @@ def _compute_surge_score(technicals: dict) -> tuple[float, list[str]]:
     return round(max(0.0, min(score, 100.0)), 2), signals
 
 
+def _prism_composite(technicals: dict) -> float:
+    """Score composite 0-100 façon PRISM : momentum 60 % + volume relatif 40 %.
+
+    Reprend `normalize_and_score` de prism-insight (ratio_weight=0.6,
+    abs_weight=0.4) en normalisant chaque composante sur 0-1.
+    """
+    volume = technicals.get("volume") or {}
+    momentum = technicals.get("momentum_pct") or {}
+    ratio = volume.get("ratio")
+    five_day = momentum.get("5d")
+
+    volume_component = 0.0
+    if ratio is not None:
+        volume_component = max(0.0, min((ratio - 1.0) / 2.0, 1.0))
+
+    momentum_component = 0.0
+    if five_day is not None:
+        momentum_component = max(0.0, min((five_day + 5.0) / 15.0, 1.0))
+
+    return round((momentum_component * 0.6 + volume_component * 0.4) * 100.0, 2)
+
+
 def _grade_score(score: float) -> str:
     if score >= 80:
         return "A+"
@@ -945,6 +1253,7 @@ def _screen_single_symbol(symbol: str, timeframe: str, limit: int) -> dict:
         "market_type": market_type,
         "price": technicals.get("price"),
         "surge_score": surge_score,
+        "prism_composite": _prism_composite(technicals),
         "grade": _grade_score(surge_score),
         "trend": technicals.get("trend"),
         "rsi14": technicals.get("rsi14"),
@@ -958,7 +1267,7 @@ def _screen_single_symbol(symbol: str, timeframe: str, limit: int) -> dict:
     }
 
 
-def run_deterministic_screener(
+def run_prism_bullish_screener(
     symbols_list: Iterable[str],
     timeframe: str = "1d",
     limit: int = 180,
@@ -967,8 +1276,10 @@ def run_deterministic_screener(
 ) -> list[dict]:
     """Scanne une liste de tickers et classe les meilleures opportunités.
 
-    Le `surge_score` (0-100) combine volume anormal, alignement EMA, RSI,
-    momentum court terme et proximité d'une résistance. Aucun appel LLM.
+    Fusionne le `scanner-bullish` de trading_skills (EMA, RSI, MACD, momentum)
+    avec les poids momentum/volume de prism-insight. Le `surge_score` (0-100)
+    combine volume anormal, alignement EMA, RSI, momentum court terme et
+    proximité d'une résistance. Aucun appel LLM.
     """
     symbols = [str(symbol).strip().upper() for symbol in symbols_list if str(symbol).strip()]
     if not symbols:
@@ -995,3 +1306,20 @@ def run_deterministic_screener(
     if top_n is not None:
         return results[: max(int(top_n), 1)]
     return results
+
+
+def run_deterministic_screener(
+    symbols_list: Iterable[str],
+    timeframe: str = "1d",
+    limit: int = 180,
+    workers: int = 8,
+    top_n: int | None = None,
+) -> list[dict]:
+    """Alias rétro-compatible de `run_prism_bullish_screener`."""
+    return run_prism_bullish_screener(
+        symbols_list,
+        timeframe=timeframe,
+        limit=limit,
+        workers=workers,
+        top_n=top_n,
+    )

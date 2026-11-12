@@ -9,3 +9,6 @@ data/*.db-shm
 data/*.db-wal
 *.log
 .DS_Store
+
+# Sources externes (non déployées)
+_sources/

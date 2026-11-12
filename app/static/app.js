@@ -6,6 +6,7 @@
     symbol: config.defaultSymbol || "BTCUSDT",
     timeframe: "1d",
     risk: config.defaultRisk || "moderate",
+    mode: "auto",
     source: null,
     quant: null,
     agents: {},
@@ -416,6 +417,10 @@
     const synthesis = $("synthesis-section");
     if (synthesis) synthesis.classList.add("hidden");
     state.synthesis = null;
+    const gatesBadge = $("buy-gates-badge");
+    if (gatesBadge) gatesBadge.textContent = "--";
+    const gatesPanel = $("buy-gates-panel");
+    if (gatesPanel) gatesPanel.textContent = "Le statut des gates déterministes apparaîtra après l'analyse.";
 
     const optionsSymbol = $("options-symbol");
     if (optionsSymbol && quant.market_type === "stock") optionsSymbol.value = quant.symbol || state.symbol;
@@ -524,10 +529,45 @@
     return "border border-slate-500/40 bg-slate-600/20 text-slate-200";
   }
 
+  function renderBuyGates(synthesis, quant) {
+    const badge = $("buy-gates-badge");
+    const panel = $("buy-gates-panel");
+    if (!panel) return;
+    const gates = (synthesis && synthesis.buy_gates) || (quant && quant.buy_gates) || null;
+    if (!gates) {
+      if (badge) badge.textContent = "--";
+      panel.innerHTML = '<p class="text-[11px] text-slate-500">Aucune évaluation de gates disponible.</p>';
+      return;
+    }
+    const allowed = Boolean(gates.allowed);
+    if (badge) {
+      badge.textContent = allowed ? "BUY autorisé" : "BUY bloqué";
+      badge.className = "rounded-md border px-2 py-0.5 text-[9px] uppercase tracking-wide " +
+        (allowed ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300" : "border-rose-500/40 bg-rose-500/10 text-rose-300");
+    }
+    const rows = (gates.gates || []).map((gate) => {
+      const blocking = Boolean(gate.blocking);
+      const passed = Boolean(gate.passed);
+      const icon = passed ? "✓" : (blocking ? "✕" : "!");
+      const cls = passed ? "text-emerald-300" : (blocking ? "text-rose-300" : "text-amber-300");
+      return '<div class="flex items-start gap-2"><span class="' + cls + ' font-semibold">' + icon + "</span>" +
+        '<div><span class="font-medium text-slate-300">' + escapeHtml(gate.name || "gate") + "</span>" +
+        (blocking ? ' <span class="text-[9px] uppercase text-slate-500">bloquant</span>' : "") +
+        '<div class="text-[10px] text-slate-500">' + escapeHtml(gate.detail || "") + "</div></div></div>";
+    }).join("");
+    const score = toNumber(gates.score);
+    panel.innerHTML =
+      '<div class="mb-1 flex items-center justify-between text-[10px] text-slate-500">' +
+      "<span>Score gates : " + (score === null ? "n/a" : num(score, 0) + "/100") + "</span>" +
+      "<span>" + (gates.blockers || []).length + " bloquant(s) · " + (gates.warnings || []).length + " avertissement(s)</span></div>" +
+      (rows || '<p class="text-[11px] text-slate-500">Aucune gate évaluée.</p>');
+  }
+
   function renderMemory(synthesis) {
     const container = $("memory-panel");
-    if (!container) return;
     const quant = state.quant || {};
+    renderBuyGates(synthesis, quant);
+    if (!container) return;
     const rules = (quant.memory_rules || []).concat(synthesis.memory_rules || []);
     const pitfalls = (quant.memory_pitfalls || []).concat(synthesis.memory_pitfalls || []);
     const summary = synthesis.memory_summary || quant.memory_summary || "";
@@ -743,6 +783,7 @@
     state.symbol = symbol;
     state.timeframe = $("timeframe-select") ? $("timeframe-select").value : "1d";
     state.risk = $("risk-select") ? $("risk-select").value : "moderate";
+    state.mode = $("mode-select") ? $("mode-select").value : "auto";
     closeStream();
     resetAnalysisUi();
     setStreaming(true);
@@ -751,6 +792,7 @@
     const params = new URLSearchParams({
       timeframe: state.timeframe,
       risk_profile: state.risk,
+      mode: state.mode,
       force_refresh: force ? "true" : "false",
     });
     const source = new EventSource(
@@ -1140,17 +1182,109 @@
     document.querySelectorAll("[data-tab]").forEach((button) => {
       button.setAttribute("aria-selected", button.dataset.tab === name ? "true" : "false");
     });
-    ["portfolio", "screener", "options"].forEach((tab) => {
+    ["portfolio", "screener", "options", "memory"].forEach((tab) => {
       const panel = $("tab-" + tab);
       if (panel) panel.classList.toggle("hidden", tab !== name);
     });
     if (name === "portfolio") loadPortfolio();
     if (name === "screener" && !state.screenerRows.length) loadScreener();
+    if (name === "memory") loadMemory();
   }
 
   // -------------------------------------------------------------------------
   // Initialisation et événements
   // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Mémoire auto-apprenante (onglet dédié)
+  // -------------------------------------------------------------------------
+  function renderMemoryMetrics(items) {
+    const container = $("memory-tab-metrics");
+    if (!container) return;
+    const total = items.length;
+    const trades = items.reduce((acc, item) => acc + (toNumber(item.total_trades) || 0), 0);
+    const weightedWin = items.reduce(
+      (acc, item) => acc + (toNumber(item.win_rate) || 0) * (toNumber(item.total_trades) || 0),
+      0
+    );
+    const avgWin = trades > 0 ? weightedWin / trades : null;
+    const cards = [
+      ["Symboles suivis", String(total)],
+      ["Trades mémorisés", String(trades)],
+      ["Win rate pondéré", avgWin === null ? "n/a" : num(avgWin, 1) + " %"],
+      ["Dernière mise à jour", items.length ? String(items[0].updated_at || "n/a").slice(0, 16).replace("T", " ") : "n/a"],
+    ];
+    container.innerHTML = cards.map(([label, value]) =>
+      '<div class="soft rounded-xl border border-slate-800 p-3"><div class="text-[9px] uppercase tracking-wide text-slate-500">' +
+      escapeHtml(label) + '</div><div class="metric-value mt-1 text-sm font-semibold text-slate-100">' +
+      escapeHtml(value) + "</div></div>"
+    ).join("");
+  }
+
+  function renderMemoryRows(items) {
+    const body = $("memory-tab-body");
+    if (!body) return;
+    if (!items.length) {
+      body.innerHTML = '<tr><td colspan="6" class="px-3 py-6 text-center text-slate-500">Aucune mémoire consolidée pour le moment.</td></tr>';
+      return;
+    }
+    body.innerHTML = items.map((item) => {
+      const win = toNumber(item.win_rate);
+      return "<tr class=\"border-t border-slate-800/60 hover:bg-slate-900/30\">" +
+        '<td class="px-3 py-2.5 font-semibold text-slate-100">' + escapeHtml(item.symbol) + "</td>" +
+        '<td class="px-2 py-2.5 text-slate-400">' + escapeHtml((item.market_type || "").toUpperCase()) + "</td>" +
+        '<td class="px-2 py-2.5 ' + (win !== null && win >= 50 ? "text-emerald-300" : "text-rose-300") + '">' + (win === null ? "n/a" : num(win, 1) + " %") + "</td>" +
+        '<td class="px-2 py-2.5 text-slate-300">' + escapeHtml(item.total_trades ?? 0) + "</td>" +
+        '<td class="px-2 py-2.5 text-slate-500">' + escapeHtml(String(item.updated_at || "n/a").slice(0, 16).replace("T", " ")) + "</td>" +
+        '<td class="px-3 py-2.5 text-slate-400"><div class="line-clamp-3 whitespace-pre-line">' + escapeHtml(item.compressed_rules || "—") + "</div></td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  async function loadMemory() {
+    try {
+      const response = await fetch("/api/memory", { headers: { Accept: "application/json" } });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const data = await response.json();
+      const items = Array.isArray(data.items) ? data.items : [];
+      renderMemoryMetrics(items);
+      renderMemoryRows(items);
+    } catch (error) {
+      const body = $("memory-tab-body");
+      if (body) body.innerHTML = '<tr><td colspan="6" class="px-3 py-6 text-center text-rose-300">' + escapeHtml(error.message) + "</td></tr>";
+      toast("Mémoire indisponible : " + error.message, true);
+    }
+  }
+
+  async function loadMemorySymbol() {
+    const input = $("memory-symbol-input");
+    const container = $("memory-tab-current");
+    if (!container) return;
+    const symbol = (input && input.value.trim()) || state.symbol || config.defaultSymbol;
+    if (!symbol) return;
+    container.innerHTML = '<span class="text-slate-500">Chargement de ' + escapeHtml(symbol) + "...</span>";
+    try {
+      const params = new URLSearchParams({ symbol: symbol, risk_profile: state.risk || "moderate" });
+      const response = await fetch("/api/memory?" + params.toString(), { headers: { Accept: "application/json" } });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const data = await response.json();
+      const context = data.context || {};
+      const performance = context.performance || {};
+      const rules = context.rules || [];
+      const pitfalls = context.pitfalls || [];
+      const lessons = context.recent_lessons || [];
+      container.innerHTML =
+        '<div class="mb-2 flex flex-wrap items-center gap-2"><span class="font-semibold text-slate-100">' + escapeHtml((context.symbol || symbol).toUpperCase()) + "</span>" +
+        '<span class="rounded-md border border-slate-700 px-2 py-0.5 text-[9px] uppercase text-slate-400">' + escapeHtml(context.market_type || "") + "</span>" +
+        '<span class="text-[10px] text-slate-500">Win rate ' + num(performance.win_rate_pct, 1) + " % · " + escapeHtml(performance.total_trades ?? 0) + " trades</span></div>" +
+        '<p class="text-[11px] leading-relaxed text-slate-300">' + escapeHtml(context.summary || "Aucun résumé.") + "</p>" +
+        (rules.length ? '<div class="mt-2 text-[9px] uppercase tracking-wide text-teal-300/80">Règles apprises</div><ul class="mt-1 list-disc space-y-1 pl-4 text-[11px] text-slate-400">' + rules.map((rule) => "<li>" + escapeHtml(rule) + "</li>").join("") + "</ul>" : "") +
+        (lessons.length ? '<div class="mt-2 text-[9px] uppercase tracking-wide text-amber-300/80">Dernières leçons</div><ul class="mt-1 list-disc space-y-1 pl-4 text-[11px] text-slate-400">' + lessons.map((lesson) => "<li>" + escapeHtml(lesson) + "</li>").join("") + "</ul>" : "") +
+        (pitfalls.length ? '<div class="mt-2 text-[9px] uppercase tracking-wide text-rose-300/80">Pièges à éviter</div><ul class="mt-1 list-disc space-y-1 pl-4 text-[11px] text-slate-500">' + pitfalls.map((pitfall) => "<li>" + escapeHtml(pitfall) + "</li>").join("") + "</ul>" : "");
+    } catch (error) {
+      container.innerHTML = '<span class="text-rose-300">' + escapeHtml(error.message) + "</span>";
+    }
+  }
+
   function renderQuickTickers() {
     const container = $("quick-tickers");
     if (!container) return;
@@ -1192,6 +1326,19 @@
 
     const refresh = $("refresh-portfolio-btn");
     if (refresh) refresh.addEventListener("click", loadPortfolio);
+    const refreshMemory = $("refresh-memory-btn");
+    if (refreshMemory) refreshMemory.addEventListener("click", loadMemory);
+    const loadMemoryBtn = $("memory-symbol-load-btn");
+    if (loadMemoryBtn) loadMemoryBtn.addEventListener("click", loadMemorySymbol);
+    const memoryInput = $("memory-symbol-input");
+    if (memoryInput) {
+      memoryInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          loadMemorySymbol();
+        }
+      });
+    }
     const runScreener = $("run-screener-btn");
     if (runScreener) runScreener.addEventListener("click", loadScreener);
     const calc = $("options-calc-btn");
@@ -1236,6 +1383,10 @@
     if (riskSelect) riskSelect.value = state.risk;
     const timeframeSelect = $("timeframe-select");
     if (timeframeSelect) timeframeSelect.value = state.timeframe;
+    const modeSelect = $("mode-select");
+    if (modeSelect) modeSelect.value = state.mode;
+    const memoryInput = $("memory-symbol-input");
+    if (memoryInput) memoryInput.value = state.symbol;
     const optionsSymbol = $("options-symbol");
     if (optionsSymbol && (!optionsSymbol.value || optionsSymbol.value === config.defaultSymbol)) {
       const stocks = config.stocks || [];

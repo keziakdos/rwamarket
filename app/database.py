@@ -13,7 +13,7 @@ import os
 import sqlite3
 from collections.abc import Iterable
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,12 @@ DEFAULT_DB_PATH = BASE_DIR / "data" / "rwamarket.db"
 DB_PATH = Path(os.getenv("DATABASE_PATH", str(DEFAULT_DB_PATH))).expanduser()
 DEFAULT_CACHE_TTL_MINUTES = int(os.getenv("CACHE_TTL_MINUTES", "30"))
 DEFAULT_INITIAL_BALANCE = float(os.getenv("INITIAL_PAPER_BALANCE", "10000.0"))
+# Délais de carence anti-rachat impulsif (extraits de PRISM-Insight).
+# Après une vente normale/gagnante : 0h par défaut (la continuation est saine).
+# Après une perte ou une sortie sur stop/tendance : 24h par défaut.
+DEFAULT_REENTRY_COOLDOWN_HOURS = float(os.getenv("REENTRY_COOLDOWN_HOURS", "0"))
+DEFAULT_REENTRY_COOLDOWN_LOSS_HOURS = float(os.getenv("REENTRY_COOLDOWN_LOSS_HOURS", "24"))
+RISK_EXIT_KINDS = {"stop", "trend_exit"}
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +180,26 @@ def init_db() -> None:
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_trading_memory_key
                 ON trading_memory (symbol, market_type);
+
+            CREATE TABLE IF NOT EXISTS reentry_cooldowns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                market_type TEXT NOT NULL,
+                last_sell_at TEXT NOT NULL,
+                exit_reason TEXT,
+                exit_kind TEXT,
+                pnl_pct REAL NOT NULL DEFAULT 0,
+                after_loss INTEGER NOT NULL DEFAULT 0,
+                risk_exit INTEGER NOT NULL DEFAULT 0,
+                cooldown_hours REAL NOT NULL DEFAULT 0,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_reentry_cooldowns_key
+                ON reentry_cooldowns (symbol, market_type);
+            CREATE INDEX IF NOT EXISTS idx_reentry_cooldowns_expires
+                ON reentry_cooldowns (expires_at);
             """
         )
 
@@ -573,6 +599,18 @@ def close_position(
         position["market_type"],
         new_lesson=lesson_learned,
     )
+    try:
+        record_reentry_cooldown(
+            position["symbol"],
+            position["market_type"],
+            exit_reason=exit_reason,
+            pnl_pct=pnl_pct,
+            closed_at=now,
+        )
+    except Exception:
+        # Le cooldown est un garde-fou : une erreur ici ne doit jamais empêcher
+        # l'enregistrement comptable du trade.
+        pass
     return trade
 
 
@@ -820,6 +858,197 @@ def delete_trading_memory(symbol: str, market_type: str) -> bool:
     with get_connection() as conn:
         cursor = conn.execute(
             "DELETE FROM trading_memory WHERE symbol = ? AND market_type = ?",
+            (symbol.upper(), market_type.lower()),
+        )
+        return cursor.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Cooldown anti-rachat impulsif (extrait de PRISM-Insight)
+# ---------------------------------------------------------------------------
+def classify_exit_kind(exit_reason: str | None, explicit: str | None = None) -> str:
+    """Normalise un motif de sortie en `stop`, `trend_exit`, `target` ou `ai`.
+
+    Les sorties liées au risque (stop ou tendance) sont traitées comme des
+    sorties « churn-risk » même lorsqu'elles se clôturent à un profit marginal.
+    """
+    if explicit:
+        return explicit
+    reason = (exit_reason or "").lower()
+    if (
+        "tier1.5" in reason
+        or "ma50" in reason
+        or "ma_50" in reason
+        or "50-day" in reason
+        or "trend" in reason
+        or "tendance" in reason
+    ):
+        return "trend_exit"
+    if (
+        "stop-loss" in reason
+        or "stop_loss" in reason
+        or "stoploss" in reason
+        or "tier1" in reason
+        or "abs7" in reason
+        or "-7%" in reason
+        or "hard stop" in reason
+        or "stop" in reason
+        or "stop loss" in reason
+        or "stop_loss" in reason
+    ):
+        return "stop"
+    if "target" in reason or "take-profit" in reason or "take_profit" in reason or "objectif" in reason:
+        return "target"
+    return "ai"
+
+
+def record_reentry_cooldown(
+    symbol: str,
+    market_type: str,
+    exit_reason: str = "manual",
+    exit_kind: str | None = None,
+    pnl_pct: float = 0.0,
+    closed_at: str | None = None,
+) -> dict:
+    """Enregistre (ou rafraîchit) le cooldown de rachat d'un symbole.
+
+    La fenêtre dépend de la nature de la sortie :
+    - perte réalisée ou sortie sur stop/tendance : `REENTRY_COOLDOWN_LOSS_HOURS`
+    - vente normale / gagnante : `REENTRY_COOLDOWN_HOURS` (0h par défaut)
+    """
+    kind = classify_exit_kind(exit_reason, exit_kind)
+    risk_exit = kind in RISK_EXIT_KINDS
+    try:
+        pnl_value = float(pnl_pct)
+    except (TypeError, ValueError):
+        pnl_value = 0.0
+    after_loss = pnl_value < 0
+    hours = (
+        DEFAULT_REENTRY_COOLDOWN_LOSS_HOURS
+        if (after_loss or risk_exit)
+        else DEFAULT_REENTRY_COOLDOWN_HOURS
+    )
+
+    sold_at = _parse_dt(closed_at) or datetime.now(UTC)
+    sold_at = sold_at.replace(microsecond=0)
+    expires_at = sold_at + timedelta(hours=hours)
+    now = utcnow_iso()
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO reentry_cooldowns
+                (symbol, market_type, last_sell_at, exit_reason, exit_kind,
+                 pnl_pct, after_loss, risk_exit, cooldown_hours, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, market_type) DO UPDATE SET
+                last_sell_at = excluded.last_sell_at,
+                exit_reason = excluded.exit_reason,
+                exit_kind = excluded.exit_kind,
+                pnl_pct = excluded.pnl_pct,
+                after_loss = excluded.after_loss,
+                risk_exit = excluded.risk_exit,
+                cooldown_hours = excluded.cooldown_hours,
+                expires_at = excluded.expires_at,
+                created_at = excluded.created_at
+            """,
+            (
+                symbol.upper(),
+                market_type.lower(),
+                sold_at.isoformat(),
+                exit_reason,
+                kind,
+                pnl_value,
+                1 if after_loss else 0,
+                1 if risk_exit else 0,
+                hours,
+                expires_at.isoformat(),
+                now,
+            ),
+        )
+
+    row = get_reentry_cooldown(symbol, market_type)
+    return row or {}
+
+
+def get_reentry_cooldown(symbol: str, market_type: str) -> dict | None:
+    """Retourne le cooldown actif ou expiré le plus récent d'un symbole."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM reentry_cooldowns
+            WHERE symbol = ? AND market_type = ?
+            """,
+            (symbol.upper(), market_type.lower()),
+        ).fetchone()
+    result = _row_to_dict(row)
+    if result is None:
+        return None
+    result["after_loss"] = bool(result.get("after_loss"))
+    result["risk_exit"] = bool(result.get("risk_exit"))
+    return result
+
+
+def is_reentry_blocked(
+    symbol: str,
+    market_type: str,
+    now: datetime | None = None,
+) -> dict | None:
+    """Retourne un verdict de blocage si le symbole est encore en cooldown.
+
+    Sinon retourne `None` (achat autorisé). Comportement « fail-open » : toute
+    erreur ou cooldown absent laisse passer l'entrée.
+    """
+    try:
+        cooldown = get_reentry_cooldown(symbol, market_type)
+    except Exception:
+        return None
+    if not cooldown:
+        return None
+
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    expires = _parse_dt(cooldown.get("expires_at"))
+    sold_at = _parse_dt(cooldown.get("last_sell_at"))
+    if expires is None or sold_at is None:
+        return None
+    if reference >= expires:
+        return None
+
+    gap_hours = (reference - sold_at).total_seconds() / 3600.0
+    return {
+        "action": "WOULD_BLOCK",
+        "symbol": cooldown["symbol"],
+        "market_type": cooldown["market_type"],
+        "last_sell": cooldown["last_sell_at"],
+        "last_ret": cooldown.get("pnl_pct"),
+        "gap_hours": round(max(gap_hours, 0.0), 2),
+        "window_hours": cooldown.get("cooldown_hours"),
+        "after_loss": cooldown.get("after_loss", False),
+        "exit_kind": cooldown.get("exit_kind"),
+        "risk_exit": cooldown.get("risk_exit", False),
+    }
+
+
+def purge_expired_reentry_cooldowns(now: datetime | None = None) -> int:
+    """Supprime les cooldowns expirés et retourne le nombre de lignes effacées."""
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM reentry_cooldowns WHERE expires_at <= ?",
+            (reference.replace(microsecond=0).isoformat(),),
+        )
+        return cursor.rowcount
+
+
+def clear_reentry_cooldown(symbol: str, market_type: str) -> bool:
+    """Supprime manuellement le cooldown d'un symbole."""
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM reentry_cooldowns WHERE symbol = ? AND market_type = ?",
             (symbol.upper(), market_type.lower()),
         )
         return cursor.rowcount > 0
