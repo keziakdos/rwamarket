@@ -149,6 +149,62 @@
   // -------------------------------------------------------------------------
   // Graphique TradingView Lightweight Charts
   // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Thème clair / sombre
+  // -------------------------------------------------------------------------
+  function currentTheme() {
+    return document.documentElement.classList.contains("light") ? "light" : "dark";
+  }
+
+  function applyChartTheme(theme) {
+    if (!state.chart) return;
+    const light = theme === "light";
+    state.chart.applyOptions({
+      layout: {
+        background: { type: "solid", color: light ? "#ffffff" : "rgba(2,6,23,0)" },
+        textColor: light ? "#475569" : "#94a3b8",
+      },
+      grid: {
+        vertLines: { color: light ? "rgba(15,23,42,.06)" : "rgba(148,163,184,.055)" },
+        horzLines: { color: light ? "rgba(15,23,42,.06)" : "rgba(148,163,184,.055)" },
+      },
+      rightPriceScale: { borderColor: light ? "rgba(15,23,42,.14)" : "rgba(148,163,184,.16)" },
+      timeScale: { borderColor: light ? "rgba(15,23,42,.14)" : "rgba(148,163,184,.16)" },
+    });
+  }
+
+  function applyTheme(theme) {
+    const resolved = theme === "light" ? "light" : "dark";
+    document.documentElement.classList.toggle("light", resolved === "light");
+    try {
+      localStorage.setItem("rwa-theme", resolved);
+    } catch (error) {
+      /* stockage indisponible : le thème reste actif pour la session */
+    }
+    const sun = $("theme-icon-sun");
+    const moon = $("theme-icon-moon");
+    if (sun) sun.classList.toggle("hidden", resolved !== "light");
+    if (moon) moon.classList.toggle("hidden", resolved === "light");
+    applyChartTheme(resolved);
+  }
+
+  function initTheme() {
+    let saved = null;
+    try {
+      saved = localStorage.getItem("rwa-theme");
+    } catch (error) {
+      saved = null;
+    }
+    const prefersLight =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-color-scheme: light)").matches;
+    applyTheme(saved || (prefersLight ? "light" : "dark"));
+  }
+
+  function toggleTheme() {
+    applyTheme(currentTheme() === "light" ? "dark" : "light");
+  }
+
   function initChart() {
     const container = $("chart-container");
     if (!container || typeof window.LightweightCharts === "undefined") {
@@ -857,6 +913,57 @@
   // -------------------------------------------------------------------------
   // Portefeuille
   // -------------------------------------------------------------------------
+  function renderPositionsMenu(positions) {
+    const list = $("positions-menu-list");
+    const count = $("header-positions-count");
+    if (count) count.textContent = String(positions.length);
+    if (!list) return;
+    if (!positions.length) {
+      list.innerHTML = '<div class="px-3 py-6 text-center text-[11px] text-slate-500">Aucune position ouverte.</div>';
+      return;
+    }
+    list.innerHTML = positions
+      .map((position) => {
+        const pnl = toNumber(position.unrealized_pnl_usd) || 0;
+        return (
+          '<div class="mb-1.5 rounded-lg border border-slate-800/70 bg-slate-950/40 p-2.5 last:mb-0">' +
+          '<div class="flex items-center justify-between gap-2">' +
+          '<div class="flex items-center gap-2"><span class="text-[11px] font-semibold text-slate-100">' + escapeHtml(position.symbol) + "</span>" +
+          '<span class="rounded border px-1.5 py-0.5 text-[9px] uppercase ' + sideClasses(position.side) + '">' + escapeHtml(position.side) + "</span>" +
+          '<span class="text-[9px] text-slate-500">' + escapeHtml(position.market_type || "") + "</span></div>" +
+          '<span class="metric-value text-[11px] font-semibold ' + tone(pnl) + '">' + fmtSigned(pnl, 2) + " $</span></div>" +
+          '<div class="mt-1 flex items-center justify-between gap-2 text-[10px] text-slate-500">' +
+          "<span>Qté " + num(position.quantity, 6) + " · Entrée " + fmtPrice(position.entry_price) + " · Actuel " + fmtPrice(position.current_price) + "</span>" +
+          '<button type="button" data-close-id="' + Number(position.id) + '" class="rounded border border-slate-700 px-2 py-1 text-[9px] text-slate-400 transition hover:border-rose-500/60 hover:text-rose-300">Fermer</button>' +
+          "</div>" +
+          '<div class="mt-0.5 text-[9px] text-slate-500">SL ' + fmtPrice(position.stop_loss) + " · TP " + fmtPrice(position.take_profit) + " · " + fmtSigned(position.unrealized_pnl_pct, 2) + " %</div>" +
+          "</div>"
+        );
+      })
+      .join("");
+  }
+
+  function renderHeaderPortfolio(data) {
+    const summary = data.summary || {};
+    const cash = $("header-cash");
+    const equity = $("header-equity");
+    if (cash) cash.textContent = fmtMoney(summary.cash_available_usd);
+    if (equity) {
+      equity.textContent = fmtMoney(summary.equity_usd);
+      equity.className = "metric-value text-sm font-semibold " + tone(summary.total_pnl_usd);
+    }
+    renderPositionsMenu(data.positions || []);
+  }
+
+  function togglePositionsMenu(force) {
+    const menu = $("positions-menu");
+    const button = $("positions-menu-btn");
+    if (!menu) return;
+    const shouldOpen = typeof force === "boolean" ? force : menu.classList.contains("hidden");
+    menu.classList.toggle("hidden", !shouldOpen);
+    if (button) button.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+  }
+
   function renderPortfolio(data) {
     const summary = data.summary || {};
     const cards = [
@@ -951,6 +1058,8 @@
           .join("");
       }
     }
+
+    renderHeaderPortfolio(data);
 
     const meta = $("tab-meta");
     if (meta && data.updated_at) {
@@ -1326,6 +1435,26 @@
 
     const refresh = $("refresh-portfolio-btn");
     if (refresh) refresh.addEventListener("click", loadPortfolio);
+    const themeToggle = $("theme-toggle");
+    if (themeToggle) themeToggle.addEventListener("click", toggleTheme);
+    const positionsBtn = $("positions-menu-btn");
+    if (positionsBtn) positionsBtn.addEventListener("click", (event) => { event.stopPropagation(); togglePositionsMenu(); });
+    const positionsRefresh = $("positions-menu-refresh");
+    if (positionsRefresh) positionsRefresh.addEventListener("click", loadPortfolio);
+    const positionsMenu = $("positions-menu");
+    if (positionsMenu) {
+      positionsMenu.addEventListener("click", (event) => {
+        const closeBtn = event.target.closest("[data-close-id]");
+        if (!closeBtn) return;
+        closePosition(closeBtn.dataset.closeId).then(() => togglePositionsMenu(false));
+      });
+    }
+    document.addEventListener("click", (event) => {
+      const menu = $("positions-menu");
+      if (!menu || menu.classList.contains("hidden")) return;
+      if (event.target.closest("#positions-menu") || event.target.closest("#positions-menu-btn")) return;
+      togglePositionsMenu(false);
+    });
     const refreshMemory = $("refresh-memory-btn");
     if (refreshMemory) refreshMemory.addEventListener("click", loadMemory);
     const loadMemoryBtn = $("memory-symbol-load-btn");
@@ -1393,9 +1522,11 @@
       const defaultStock = stocks.includes(optionsSymbol.value) ? optionsSymbol.value : stocks[0];
       if (defaultStock) optionsSymbol.value = defaultStock;
     }
+    initTheme();
     renderQuickTickers();
     bindEvents();
     initChart();
+    applyChartTheme(currentTheme());
     activateTab("portfolio");
     setInterval(loadPortfolio, 30_000);
   }
