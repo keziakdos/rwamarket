@@ -1,0 +1,15 @@
+services:
+  rwamarket:
+    build: .
+    container_name: rwamarket_app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8095:8000"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+    deploy:
+      resources:
+        limits:
+          memory: 512M
