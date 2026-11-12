@@ -1288,16 +1288,39 @@
   // Onglets
   // -------------------------------------------------------------------------
   function activateTab(name) {
+    const isAnalysis = name === "analyse";
     document.querySelectorAll("[data-tab]").forEach((button) => {
       button.setAttribute("aria-selected", button.dataset.tab === name ? "true" : "false");
     });
+    // Chaque section est une vue plein écran : aucune obligation de défiler.
+    const analysisView = $("view-analyse");
+    if (analysisView) analysisView.classList.toggle("hidden", !isAnalysis);
+    const tabsView = $("view-tabs");
+    if (tabsView) tabsView.classList.toggle("hidden", isAnalysis);
+    const controls = $("analysis-controls");
+    if (controls) controls.classList.toggle("hidden", !isAnalysis);
+    const quick = $("quick-tickers");
+    if (quick) quick.classList.toggle("hidden", !isAnalysis);
+
     ["portfolio", "screener", "options", "memory"].forEach((tab) => {
       const panel = $("tab-" + tab);
       if (panel) panel.classList.toggle("hidden", tab !== name);
     });
+    if (isAnalysis) {
+      const meta = $("tab-meta");
+      if (meta) meta.textContent = "Données d'analyse en temps réel";
+      // Le graphique doit être redimensionné après réaffichage de sa vue.
+      if (state.chart) {
+        window.requestAnimationFrame(() => {
+          const container = $("chart-container");
+          if (container) state.chart.applyOptions({ width: Math.max(container.clientWidth, 320) });
+        });
+      }
+    }
     if (name === "portfolio") loadPortfolio();
     if (name === "screener" && !state.screenerRows.length) loadScreener();
     if (name === "memory") loadMemory();
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   // -------------------------------------------------------------------------
@@ -1527,7 +1550,7 @@
     bindEvents();
     initChart();
     applyChartTheme(currentTheme());
-    activateTab("portfolio");
+    activateTab("analyse");
     setInterval(loadPortfolio, 30_000);
   }
 
