@@ -68,16 +68,35 @@ def _watchlist(env_name: str, default: str) -> list[str]:
 
 
 def get_crypto_watchlist() -> list[str]:
-    return _watchlist("WATCHLIST_CRYPTO", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT")
+    return _watchlist(
+        "WATCHLIST_CRYPTO",
+        "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,DOTUSDT",
+    )
 
 
 def get_stock_watchlist() -> list[str]:
-    return _watchlist("WATCHLIST_STOCKS", "NVDA,AAPL,MSFT,TSLA,SPY")
+    return _watchlist(
+        "WATCHLIST_STOCKS",
+        "NVDA,AAPL,MSFT,TSLA,SPY,QQQ,AMZN,GOOGL,META,AMD",
+    )
+
+
+def get_index_watchlist() -> list[str]:
+    return _watchlist("WATCHLIST_INDICES", "^GSPC,^IXIC,^DJI,^VIX")
+
+
+def get_forex_watchlist() -> list[str]:
+    return _watchlist("WATCHLIST_FOREX", "EURUSD=X,GBPUSD=X,USDJPY=X,GC=F,CL=F")
 
 
 def get_combined_watchlist() -> list[str]:
     symbols: list[str] = []
-    for symbol in get_crypto_watchlist() + get_stock_watchlist():
+    for symbol in (
+        get_crypto_watchlist()
+        + get_stock_watchlist()
+        + get_index_watchlist()
+        + get_forex_watchlist()
+    ):
         if symbol not in symbols:
             symbols.append(symbol)
     return symbols
@@ -311,6 +330,8 @@ def _template_config() -> dict:
         "watchlist": get_combined_watchlist(),
         "crypto": get_crypto_watchlist(),
         "stocks": get_stock_watchlist(),
+        "indices": get_index_watchlist(),
+        "forex": get_forex_watchlist(),
     }
 
 
@@ -495,6 +516,22 @@ async def get_trading_memory(
         "success": True,
         "count": len(items),
         "items": items,
+        "generated_at": datetime.now(UTC).isoformat(),
+    }
+
+
+@app.post("/api/memory/refresh")
+async def refresh_trading_memory(_auth: None = Depends(require_auth)):
+    """Recompresse la mémoire de tous les symboles ayant des trades clôturés."""
+    try:
+        results = await trading_memory.update_all_trading_memories(force_llm=False)
+    except Exception as exc:
+        logger.exception("Échec de la recompression mémoire")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "success": True,
+        "updated": len(results),
+        "results": results,
         "generated_at": datetime.now(UTC).isoformat(),
     }
 

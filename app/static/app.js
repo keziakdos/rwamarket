@@ -1356,7 +1356,7 @@
     const body = $("memory-tab-body");
     if (!body) return;
     if (!items.length) {
-      body.innerHTML = '<tr><td colspan="6" class="px-3 py-6 text-center text-slate-500">Aucune mémoire consolidée pour le moment.</td></tr>';
+      body.innerHTML = '<tr><td colspan="6" class="px-3 py-8 text-center text-slate-500">Aucune mémoire consolidée.<br><span class="text-[10px]">Ouvrez puis clôturez un trade Paper Trading (ou laissez le SL/TP se déclencher) : la mémoire se remplit automatiquement. Le bouton « Recompresser la mémoire » force la mise à jour.</span></td></tr>';
       return;
     }
     body.innerHTML = items.map((item) => {
@@ -1420,11 +1420,26 @@
   function renderQuickTickers() {
     const container = $("quick-tickers");
     if (!container) return;
-    const symbols = Array.from(new Set(config.watchlist || [])).slice(0, 10);
-    container.innerHTML = symbols
+    const groups = [
+      { label: "Crypto", items: config.crypto || [] },
+      { label: "Actions", items: config.stocks || [] },
+      { label: "Indices", items: config.indices || [] },
+      { label: "Forex / Matières", items: config.forex || [] },
+    ];
+    container.innerHTML = groups
+      .filter((group) => group.items.length)
       .map(
-        (symbol) =>
-          '<button type="button" data-quick-ticker="' + escapeHtml(symbol) + '" class="rounded-lg border border-slate-700/80 bg-slate-900/30 px-2.5 py-1 text-[10px] font-medium text-slate-400 transition hover:border-teal-500/60 hover:text-teal-200">' + escapeHtml(symbol) + "</button>"
+        (group) =>
+          '<div class="flex flex-wrap items-center gap-1.5"><span class="text-[9px] uppercase tracking-[.14em] text-slate-500">' +
+          escapeHtml(group.label) +
+          "</span>" +
+          group.items
+            .map(
+              (symbol) =>
+                '<button type="button" data-quick-ticker="' + escapeHtml(symbol) + '" class="rounded-lg border border-slate-700/80 bg-slate-900/30 px-2.5 py-1 text-[10px] font-medium text-slate-400 transition hover:border-teal-500/60 hover:text-teal-200">' + escapeHtml(symbol) + "</button>"
+            )
+            .join("") +
+          "</div>"
       )
       .join("");
     container.querySelectorAll("[data-quick-ticker]").forEach((button) => {
@@ -1432,6 +1447,7 @@
         const ticker = button.dataset.quickTicker;
         const input = $("ticker-input");
         if (input) input.value = ticker;
+        activateTab("analyse");
         runAnalysis(false);
       });
     });
@@ -1480,6 +1496,24 @@
     });
     const refreshMemory = $("refresh-memory-btn");
     if (refreshMemory) refreshMemory.addEventListener("click", loadMemory);
+    const compressMemory = $("compress-memory-btn");
+    if (compressMemory) {
+      compressMemory.addEventListener("click", async () => {
+        compressMemory.disabled = true;
+        const original = compressMemory.textContent;
+        compressMemory.textContent = "Compression...";
+        try {
+          const result = await api("/api/memory/refresh", { method: "POST" });
+          toast("Mémoire recompressée : " + (result.updated || 0) + " symbole(s).");
+          await loadMemory();
+        } catch (error) {
+          toast("Compression impossible : " + error.message, true);
+        } finally {
+          compressMemory.disabled = false;
+          compressMemory.textContent = original;
+        }
+      });
+    }
     const loadMemoryBtn = $("memory-symbol-load-btn");
     if (loadMemoryBtn) loadMemoryBtn.addEventListener("click", loadMemorySymbol);
     const memoryInput = $("memory-symbol-input");

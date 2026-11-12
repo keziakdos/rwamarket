@@ -25,6 +25,9 @@
     };
   </script>
   <style>
+    /* Rendu équivalent à un zoom navigateur de 125 % */
+    html { zoom: 1.25; }
+    @supports not (zoom: 1) { html { zoom: normal; font-size: 20px; } }
     body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
     .page-bg {
       background:
@@ -571,7 +574,10 @@
           <h2 class="text-xs font-semibold uppercase tracking-[.14em] text-slate-400">Mémoire auto-apprenante PRISM-Insight</h2>
           <p class="mt-1 text-[11px] text-slate-500">Leçons compressées, win rate et pièges par symbole. Mise à jour à chaque trade clôturé.</p>
         </div>
-        <button id="refresh-memory-btn" type="button" class="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 transition hover:border-teal-500/60 hover:text-teal-200">Rafraîchir</button>
+        <div class="flex items-center gap-2">
+          <button id="compress-memory-btn" type="button" class="rounded-lg border border-teal-500/50 bg-teal-500/10 px-3 py-2 text-xs font-medium text-teal-200 transition hover:border-teal-400 hover:text-teal-100">Recompresser la mémoire</button>
+          <button id="refresh-memory-btn" type="button" class="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 transition hover:border-teal-500/60 hover:text-teal-200">Rafraîchir</button>
+        </div>
       </div>
 
       <div id="memory-tab-metrics" class="mb-4 grid grid-cols-2 gap-2.5 sm:grid-cols-4"></div>
@@ -615,6 +621,6 @@
 <script>
   window.RWA_CONFIG = {{ config | tojson }};
 </script>
-<script src="/static/app.js?v=7" defer></script>
+<script src="/static/app.js?v=8" defer></script>
 </body>
 </html>
