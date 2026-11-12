@@ -750,7 +750,9 @@ async def fetch_stock_ohlcv(
     if _alpaca_headers() is not None and _alpaca_supported(symbol):
         try:
             df = await fetch_stock_ohlcv_alpaca(symbol, timeframe, limit)
-            if not df.empty:
+            # Le flux IEX gratuit renvoie parfois une seule bougie : on exige un
+            # historique suffisant, sinon on bascule sur yfinance/Yahoo.
+            if not df.empty and len(df) >= 20:
                 return df.tail(limit)
         except Exception:
             pass
