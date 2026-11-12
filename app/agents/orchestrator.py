@@ -1394,7 +1394,11 @@ async def stream_market_analysis(
     extras = await _fetch_context_extras(
         normalized_symbol,
         market_type,
-        include_options=(market_type == "stock"),
+        include_options=(
+            market_type == "stock"
+            and not normalized_symbol.startswith("^")
+            and "=" not in normalized_symbol
+        ),
     )
     news_items = extras.get("news") or []
     quant_payload["news_headlines"] = [

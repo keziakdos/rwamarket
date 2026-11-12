@@ -532,6 +532,18 @@ async def fetch_crypto_price(symbol: str) -> dict:
 # ---------------------------------------------------------------------------
 # Actions US : Alpaca (optionnel) puis yfinance
 # ---------------------------------------------------------------------------
+def _alpaca_supported(symbol: str) -> bool:
+    """Alpaca ne gère que les actions/ETF US simples.
+
+    Les indices (`^IXIC`), le forex (`EURUSD=X`) et les futures (`GC=F`) ne
+    doivent jamais être envoyés à Alpaca : ils sont servis par yfinance.
+    """
+    raw = str(symbol or "").strip().upper()
+    if not raw or raw.startswith("^") or "=" in raw or "/" in raw:
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9.\-]+", raw))
+
+
 def _alpaca_headers() -> dict | None:
     api_key = os.getenv("ALPACA_API_KEY", "").strip()
     secret = os.getenv("ALPACA_SECRET_KEY", "").strip()
@@ -549,6 +561,8 @@ async def fetch_stock_ohlcv_alpaca(
     headers = _alpaca_headers()
     if headers is None:
         raise DataFetchError("Clés Alpaca absentes.")
+    if not _alpaca_supported(symbol):
+        raise DataFetchError(f"Symbole non supporté par Alpaca : {symbol}.")
 
     tf = _normalize_timeframe(timeframe)
     alpaca_tf = ALPACA_TIMEFRAMES.get(tf, "1Day")
@@ -614,6 +628,8 @@ async def fetch_stock_ohlcv_yfinance(
     except Exception:
         pass
 
+    if not _alpaca_supported(symbol):
+        raise DataFetchError(f"Impossible de récupérer les bougies de {symbol} via yfinance.")
     try:
         return await fetch_stock_ohlcv_alpaca(symbol, timeframe, limit)
     except Exception as exc:
@@ -625,8 +641,8 @@ async def fetch_stock_ohlcv(
     timeframe: str = "1d",
     limit: int = 300,
 ) -> pd.DataFrame:
-    """OHLCV actions : Alpaca en priorité si configuré, yfinance sinon."""
-    if _alpaca_headers() is not None:
+    """OHLCV actions : Alpaca en priorité si configuré et supporté, yfinance sinon."""
+    if _alpaca_headers() is not None and _alpaca_supported(symbol):
         try:
             df = await fetch_stock_ohlcv_alpaca(symbol, timeframe, limit)
             if not df.empty:

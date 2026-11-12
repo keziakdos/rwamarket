@@ -837,6 +837,7 @@
       return;
     }
     state.symbol = symbol;
+    renderQuickTickers();
     state.timeframe = $("timeframe-select") ? $("timeframe-select").value : "1d";
     state.risk = $("risk-select") ? $("risk-select").value : "moderate";
     state.mode = $("mode-select") ? $("mode-select").value : "auto";
@@ -1430,16 +1431,21 @@
       .filter((group) => group.items.length)
       .map(
         (group) =>
-          '<div class="flex flex-wrap items-center gap-1.5"><span class="text-[9px] uppercase tracking-[.14em] text-slate-500">' +
-          escapeHtml(group.label) +
-          "</span>" +
+          '<div class="rounded-xl border border-slate-800/80 bg-slate-950/30 px-2.5 py-2">' +
+          '<div class="mb-1.5 flex items-center justify-between gap-2">' +
+          '<span class="text-[9px] font-semibold uppercase tracking-[.14em] text-teal-300">' + escapeHtml(group.label) + "</span>" +
+          '<span class="text-[9px] text-slate-500">' + group.items.length + "</span></div>" +
+          '<div class="flex flex-wrap gap-1">' +
           group.items
-            .map(
-              (symbol) =>
-                '<button type="button" data-quick-ticker="' + escapeHtml(symbol) + '" class="rounded-lg border border-slate-700/80 bg-slate-900/30 px-2.5 py-1 text-[10px] font-medium text-slate-400 transition hover:border-teal-500/60 hover:text-teal-200">' + escapeHtml(symbol) + "</button>"
-            )
+            .map((symbol) => {
+              const active = String(state.symbol).toUpperCase() === String(symbol).toUpperCase();
+              const chipClass = active
+                ? "border-teal-500/60 bg-teal-500/15 text-teal-200"
+                : "border-slate-700/80 bg-slate-900/30 text-slate-400 hover:border-teal-500/60 hover:text-teal-200";
+              return '<button type="button" data-quick-ticker="' + escapeHtml(symbol) + '" class="rounded-lg border px-2 py-1 text-[10px] font-medium transition ' + chipClass + '">' + escapeHtml(symbol) + "</button>";
+            })
             .join("") +
-          "</div>"
+          "</div></div>"
       )
       .join("");
     container.querySelectorAll("[data-quick-ticker]").forEach((button) => {

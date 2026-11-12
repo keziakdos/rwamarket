@@ -26,7 +26,7 @@
   </script>
   <style>
     /* Rendu équivalent à un zoom navigateur de 125 % */
-    html { zoom: 1.25; }
+    html { zoom: 1.10; }
     @supports not (zoom: 1) { html { zoom: normal; font-size: 20px; } }
     body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
     .page-bg {
@@ -227,7 +227,7 @@
         <span class="text-[10px] text-slate-500">(Ignorer Cache)</span>
       </button>
     </div>
-    <div id="quick-tickers" class="mt-2.5 flex flex-wrap gap-1.5"></div>
+    <div id="quick-tickers" class="mt-2.5 grid gap-2 sm:grid-cols-2 xl:grid-cols-4"></div>
   </div>
 </header>
 
@@ -621,6 +621,6 @@
 <script>
   window.RWA_CONFIG = {{ config | tojson }};
 </script>
-<script src="/static/app.js?v=8" defer></script>
+<script src="/static/app.js?v=9" defer></script>
 </body>
 </html>
